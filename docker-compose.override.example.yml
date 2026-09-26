@@ -1,0 +1,9 @@
+# Copy to docker-compose.override.yml (git-ignored) to build the crw engine
+# from this checkout — required to run the local patches (see FORK-NOTES.md):
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#   docker compose build crw && docker compose up -d
+# To go back to the published image, remove the override file and
+# `docker compose up -d --force-recreate crw`.
+services:
+  crw:
+    image: crw-camofox:local
