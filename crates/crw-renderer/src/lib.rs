@@ -485,6 +485,22 @@ impl std::fmt::Debug for FallbackRenderer {
     }
 }
 
+/// Whether the camofox orphan reap may run for this endpoint.
+///
+/// The reap decides with a ledger that is PROCESS-LOCAL ("which tab ids did I
+/// register?") against a tab set camofox keys by `userId` alone, so it can only
+/// tell its own tabs from strangers when crw owns the endpoint outright.
+/// `manage = true` is that claim: crw started this camofox itself. With an
+/// external endpoint (`manage = false`, the container contract) anything else
+/// sharing the `userId` — a second crw, a leftover daemon — looks exactly like an
+/// orphan, and closing it would cost a live request somewhere else. So the
+/// config flag can turn the reap OFF, and cannot turn it ON where ownership is
+/// not established.
+#[cfg(feature = "camofox")]
+fn orphan_reap_enabled(endpoint: &crw_core::config::CamofoxEndpoint) -> bool {
+    endpoint.reap_orphan_tabs && endpoint.manage
+}
+
 impl FallbackRenderer {
     pub fn new(
         config: &RendererConfig,
@@ -628,7 +644,11 @@ impl FallbackRenderer {
                     cf.api_key.clone(),
                     Duration::from_millis(config.chrome_timeout()),
                 )
-                .with_challenge_wait(Duration::from_millis(cf.challenge_wait_ms));
+                .with_challenge_wait(Duration::from_millis(cf.challenge_wait_ms))
+                // Reap tabs camofox registered but whose create answer we never
+                // read — where crw can actually tell them from a stranger's (see
+                // `orphan_reap_enabled`).
+                .with_orphan_reap(orphan_reap_enabled(cf));
                 if cf.clearance_reuse {
                     tier = tier.with_clearance_cache(Arc::clone(&clearance));
                 }
@@ -2591,6 +2611,7 @@ mod tests {
                 api_key: None,
                 challenge_wait_ms: 5_000,
                 clearance_reuse: false,
+                reap_orphan_tabs: true,
                 manage: false,
             }),
             ..Default::default()
@@ -2599,6 +2620,37 @@ mod tests {
             .expect("camofox tier builds");
         assert_eq!(r.js_renderer_names(), vec!["camofox"]);
         assert!(r.clearance().is_empty());
+    }
+
+    /// The reap decides with a per-process ledger against a tab set camofox keys
+    /// by `userId` alone, so it may only run where crw owns the endpoint. Pinning
+    /// the gate itself: the config flag can switch it OFF, and cannot switch it
+    /// ON against an external endpoint a second process may be sharing.
+    #[cfg(feature = "camofox")]
+    #[test]
+    fn orphan_reap_requires_endpoint_ownership() {
+        use crw_core::config::CamofoxEndpoint;
+        let endpoint = |reap: bool, manage: bool| CamofoxEndpoint {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: None,
+            challenge_wait_ms: 0,
+            clearance_reuse: false,
+            reap_orphan_tabs: reap,
+            manage,
+        };
+        assert!(
+            orphan_reap_enabled(&endpoint(true, true)),
+            "managed endpoint, flag on: reap"
+        );
+        assert!(
+            !orphan_reap_enabled(&endpoint(true, false)),
+            "external endpoint: never reap, however the flag is set"
+        );
+        assert!(
+            !orphan_reap_enabled(&endpoint(false, true)),
+            "the flag is the documented kill switch"
+        );
+        assert!(!orphan_reap_enabled(&endpoint(false, false)));
     }
 
     #[test]
@@ -2656,6 +2708,7 @@ mod tests {
                     api_key: None,
                     challenge_wait_ms: 20_000,
                     clearance_reuse: true,
+                    reap_orphan_tabs: true,
                     manage: false,
                 }),
                 ..Default::default()

@@ -1065,6 +1065,34 @@ pub struct CamofoxEndpoint {
     /// them and skip the browser on the next scrape of that host.
     #[serde(default = "default_clearance_reuse")]
     pub clearance_reuse: bool,
+    /// Reap the tab a `POST /tabs` registered server-side but never told us
+    /// about (its response lost to a timeout, a dropped connection, or this
+    /// future being cancelled mid-create). Left alone, such a tab holds one of
+    /// the session's `MAX_TABS_PER_SESSION` (10 by default) slots for the full
+    /// 30 min session timeout — camofox's idle reaper only collects ZERO-tab
+    /// sessions — so ten of them and every create hard-fails 429.
+    ///
+    /// When a create answer cannot be read, the renderer lists `GET /tabs` and
+    /// closes the one tab camofox has that crw never registered, only if exactly
+    /// one such tab exists, it reports crw's own `sessionKey`, and it is still
+    /// `about:blank` (crw creates blank and navigates separately, so a navigated
+    /// tab belongs to someone else).
+    ///
+    /// The ledger of "tabs I registered" is per-process, while camofox keys tabs
+    /// by `userId` only — so this is safe only when crw owns the endpoint. It is
+    /// therefore effective when this flag is on AND `manage` is on; with an
+    /// external endpoint a second crw process sharing the same `userId` looks
+    /// exactly like an orphan, and reaping would close its in-flight tab.
+    ///
+    /// `manage` is the proxy for ownership, not its proof: the supervisor adopts
+    /// anything already answering `/health` without starting it, so two crw
+    /// processes can both run with `manage = true` against one endpoint and both
+    /// believe it is theirs. The real requirement is one crw process per
+    /// `userId` + `sessionKey` per endpoint — do not run two crw servers against
+    /// the same camofox while reaping is on. On by default; this flag is the
+    /// escape hatch: `CRW_RENDERER__CAMOFOX__REAP_ORPHAN_TABS=false`.
+    #[serde(default = "default_reap_orphan_tabs")]
+    pub reap_orphan_tabs: bool,
     /// Take over the lifecycle of the camofox-browser server at `base_url`.
     /// When true, crw probes `GET /health` before each Camofox-tier request
     /// and search call and — when nothing answers — spawns the server itself
@@ -1083,6 +1111,10 @@ pub struct CamofoxEndpoint {
 
 fn default_challenge_wait_ms() -> u64 {
     20_000
+}
+
+fn default_reap_orphan_tabs() -> bool {
+    true
 }
 
 /// HTTP endpoint for the Byparr challenge-solver tier (a FlareSolverr-compatible

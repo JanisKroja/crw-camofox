@@ -7,6 +7,61 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **camofox: tabs no longer leak when a fetch is cancelled or a create answer is
+  lost.** A cancelled fetch (a crawl's `handle.abort()`, or the outer request
+  timeout dropping the handler) used to leave its tab open, and so did a
+  `POST /tabs` whose response never arrived — camofox registers the tab
+  server-side *before* it replies with the id. Those tabs are not self-healing:
+  camofox's idle reaper only collects zero-tab sessions, so each one holds a
+  slot of the session's `MAX_TABS_PER_SESSION` (10 by default) for the full 30 min
+  session timeout, and ten of them turn every later create into a 429. The fetch
+  tab is now held by a guard that closes it inline on every normal path and, if
+  the future was dropped, reaps it from a detached task; an interrupted or
+  unanswered create lists the session and closes the tab it cannot account for,
+  confirmed by re-listing.
+- **camofox (search): a warm tab abandoned after a dropped connection is now
+  closed, not just forgotten.** A client timeout already replaced the tab; a
+  transport error kept the id cached while its page stayed alive server-side,
+  working through the same tab cap. A tab the server itself reported gone
+  (404/5xx) is still not DELETEd — that is the server's own word that it already
+  reaped it.
+- **camofox (search): a tab that cannot be closed now says so.** A close that
+  never reached the server, or outlasted its budget, was logged at `debug` on
+  the theory that camofox usually finishes it — but the budget was shorter than
+  the server's own allowance for a page close, so giving up meant the server was
+  genuinely wedged and the tab was really still there. It is a `warn` now, and
+  the budget sits above that allowance. Likewise a `POST /tabs` that answers 2xx
+  without a usable id — camofox registers the tab before it replies, so that one
+  is a leak, not a stall, and it is no longer reported as a generic bad response.
+- **camofox (search): the close of an abandoned tab is no longer something the
+  search waits on, or gives up on.** It was issued inline under a 2 s budget —
+  shorter than the 5 s camofox itself allows the page close, on a tab whose
+  navigate the server may still be working. Hanging up first left the tab listed
+  with nobody in this client able to notice (there is no list-and-reap here), and
+  one was seen living out its full 30 min session timeout while the search
+  reported clean results. The close now runs detached, under a budget longer
+  than the server's own.
+- **camofox (search): no tab create can be cancelled any more.** This client has
+  one closer — `close_tab`, by id — and no way to list what it is missing, so a
+  `POST /tabs` dropped mid-request was a tab whose id would never be known: a
+  slot of the session's tab cap, gone until the session timeout. Every create
+  now runs in a task that outlives the request that wanted it and publishes its
+  id where the next search adopts it, so waiting can be bounded (which is what
+  made the cancellation tempting in the first place) without losing anything.
+- The tab-close budget no longer produces a leak signal when only the *client*
+  gave up: camofox allows its own `safePageClose` 5 s against our shorter
+  timeout, so that close usually lands anyway.
+
+### Added
+
+- `crw_camofox_tab_leak_total{renderer,cause}` — counts a tab left open by a
+  cancellation, an orphan reaped after its create answer was lost, and a close
+  camofox accepted but did not perform. Empty in normal operation.
+- `renderer.camofox.reap_orphan_tabs` (default on, `manage = true` required) to
+  turn the orphan reap off; see `docs/docs/configuration.md`.
+
 ## [1.5.0] - 2026-09-16
 
 A fingerprint release: a Chrome-impersonated HTTP tier sits between the plain

@@ -67,6 +67,23 @@ ws_url = "ws://127.0.0.1:9222/"
 # api_key = "..."                 # only if the camofox server runs with auth
 # challenge_wait_ms = 20000       # wait for a Cloudflare "Just a moment" page to clear; 0 = off
 # clearance_reuse = true          # cache cf_clearance + UA per host, reuse on the HTTP tier
+# reap_orphan_tabs = true         # close the tab a `POST /tabs` registered server-side but never
+#                                 # named to us (answer lost to a timeout, a disconnect, or the
+#                                 # request being cancelled mid-create). Such a tab otherwise
+#                                 # holds 1 of the session's 10 tab slots for the full 30 min
+#                                 # session timeout — camofox's idle reaper only collects
+#                                 # ZERO-tab sessions — and 10 of them make every create fail 429.
+#                                 # Only acts when it can list tabs, finds exactly one it never
+#                                 # registered, that tab reports crw's own sessionKey, and it is
+#                                 # still about:blank. Needs `manage = true`: the "what I
+#                                 # registered" ledger is per-process while camofox keys tabs by
+#                                 # userId, so against a shared external endpoint a second crw
+#                                 # process would look like an orphan. `manage = true` is the
+#                                 # proxy for ownership, not its proof — an already-running
+#                                 # camofox is adopted rather than started, so two crw servers
+#                                 # on one endpoint both believe it is theirs. Run ONE crw per
+#                                 # userId+sessionKey per camofox.
+#                                 # Reaps count crw_camofox_tab_leak_total{cause="create-orphan"}.
 
 # Byparr (FlareSolverr-compatible challenge solver, e.g. ghcr.io/thephaseless/byparr).
 # Tried last, and only when an earlier attempt came back as an anti-bot challenge
@@ -156,6 +173,7 @@ Use the `CRW_` prefix with `__` as a nesting separator:
 | `renderer.camofox.api_key` | `CRW_RENDERER__CAMOFOX__API_KEY` |
 | `renderer.camofox.challenge_wait_ms` | `CRW_RENDERER__CAMOFOX__CHALLENGE_WAIT_MS` |
 | `renderer.camofox.clearance_reuse` | `CRW_RENDERER__CAMOFOX__CLEARANCE_REUSE` |
+| `renderer.camofox.reap_orphan_tabs` | `CRW_RENDERER__CAMOFOX__REAP_ORPHAN_TABS` |
 | `renderer.byparr.base_url` | `CRW_RENDERER__BYPARR__BASE_URL` |
 | `renderer.byparr.timeout_ms` | `CRW_RENDERER__BYPARR__TIMEOUT_MS` |
 | `renderer.byparr.max_concurrent` | `CRW_RENDERER__BYPARR__MAX_CONCURRENT` |

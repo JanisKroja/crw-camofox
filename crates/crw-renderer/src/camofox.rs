@@ -8,7 +8,7 @@
 //! the tab. It implements the same [`PageFetcher`] trait as the CDP renderers
 //! so it slots into `FallbackRenderer`'s failover ladder unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -122,7 +122,26 @@ pub struct CamofoxRenderer {
     /// milliseconds when the context is warm, so holding this only across the
     /// create call costs nothing in steady state; navigation itself runs
     /// concurrently.
-    create_lock: tokio::sync::Mutex<()>,
+    ///
+    /// This lock is ALSO what makes the create-orphan reap
+    /// ([`CamofoxRenderer::reap_lost_create`] sound: every create, every
+    /// registration into [`Self::known_ids`], and every reap runs inside it, so
+    /// a tab the server has registered but we have not yet named provably has no
+    /// in-process owner. Do not narrow the critical section without re-reading
+    /// that method's docs.
+    create_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Ids of tabs this process created and has not closed. The orphan reap
+    /// lists camofox's view and treats anything NOT in here as a candidate;
+    /// behind [`Self::create_lock`] that is exact, because camofox registers a
+    /// tab before it responds with the id (so an in-flight peer create is
+    /// already listable, and its id lands here before the lock is released).
+    known_ids: TabRegistry,
+    /// Kill switch for the create-orphan reap (config
+    /// `renderer.camofox.reap_orphan_tabs`, env
+    /// `CRW_RENDERER__CAMOFOX__REAP_ORPHAN_TABS`). On by default; it is the
+    /// escape hatch if the reap ever misidentifies, since closing the wrong tab
+    /// costs a request while leaking one costs a session slot for 30 minutes.
+    reap_orphans: bool,
     /// Cap on the passive challenge wait; `ZERO` disables the loop.
     challenge_wait: Duration,
     /// Sleep between challenge probes ([`CHALLENGE_POLL_INTERVAL`]).
@@ -155,6 +174,638 @@ impl CookiesResponse {
 struct CreateTabResponse {
     #[serde(rename = "tabId")]
     tab_id: String,
+}
+
+/// `GET /tabs` response — the server's view of the tabs live under one
+/// `userId`. Verified live and against the server's own route handler: it
+/// filters by `userId` and NOTHING else (`sessionKey` is accepted and
+/// ignored), it needs no API key, and it builds each row by `await`ing
+/// `page.url()` / `page.title()` — so it is NOT a cheap call and can stall
+/// behind a wedged page. Every caller bounds it and treats failure as "do not
+/// touch anything".
+#[derive(Deserialize, Default)]
+struct TabListResponse {
+    #[serde(default)]
+    tabs: Vec<TabInfo>,
+}
+
+/// One row of [`TabListResponse`]: the id we would close, plus the URL the
+/// blank-tab filter needs in order to decide whether it is ours to close.
+#[derive(Deserialize, Clone, Debug)]
+struct TabInfo {
+    #[serde(rename = "tabId")]
+    tab_id: String,
+    #[serde(default)]
+    url: String,
+    /// Which browser-context group the tab belongs to. `GET /tabs` merges every
+    /// session of the `userId` (`core.js:553-561` iterates `session.tabGroups`,
+    /// keyed by sessionKey) and tags each row with it, while the create that
+    /// made our tab asked for [`SESSION_KEY`] — so this is the only attribution
+    /// the endpoint offers, and the reap requires it to match.
+    #[serde(rename = "listItemId", default)]
+    list_item_id: Option<String>,
+}
+
+/// Outcome of a best-effort tab DELETE. Note deliberately what is NOT a case
+/// here: proof.
+#[derive(Debug)]
+enum CloseOutcome {
+    /// camofox accepted the request. NOT proof the tab closed: the route
+    /// answers `{ok:true}` even when its lookup finds nothing (unknown id, or
+    /// a `userId` mismatch), so `DELETE /tabs/{id}` never 404s. Only
+    /// [`confirm_gone`] proves closure.
+    Accepted,
+    Rejected(u16),
+    Failed(String),
+    /// We gave up after [`CLEANUP_BUDGET`]. Usually a false alarm — the server
+    /// gives its own `safePageClose` 5 s and Node finishes the handler after
+    /// our client hangs up — so this is never a metric.
+    TimedOut,
+}
+
+/// Fire the best-effort `DELETE /tabs/{id}`. Shared by the inline close, the
+/// orphan reap, and the detached cancel-path close — the last of those runs
+/// from a `Drop`, so it cannot borrow `self` and the pieces come in by value.
+async fn send_tab_delete(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    tab_id: &str,
+) -> CloseOutcome {
+    let mut req = client.delete(format!("{base_url}/tabs/{tab_id}"));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    // The userId rides in the JSON body on this route, exactly as it always
+    // has. Do not "tidy" it into a query param: a DELETE whose body does not
+    // match the tab's userId still answers `{ok:true}`, so a mistake here
+    // leaks every tab while logging success.
+    let fut = req.json(&json!({ "userId": USER_ID })).send();
+    match tokio::time::timeout(CLEANUP_BUDGET, fut).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status();
+            // A 404 is not producible on this route today; kept so a server
+            // that starts reporting one reads as "already gone", not failure.
+            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                CloseOutcome::Accepted
+            } else {
+                CloseOutcome::Rejected(status.as_u16())
+            }
+        }
+        Ok(Err(e)) => CloseOutcome::Failed(crw_core::error::reqwest_message(e)),
+        Err(_) => CloseOutcome::TimedOut,
+    }
+}
+
+/// `GET /tabs?userId=…`, bounded by [`CLEANUP_BUDGET`] because the server
+/// builds it by awaiting `page.title()` once per tab. Any failure — transport,
+/// timeout, non-2xx, undecodable body — is an error here, and every caller
+/// treats "could not list" as "close nothing".
+async fn list_tabs(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> CrwResult<Vec<TabInfo>> {
+    let mut req = client.get(format!("{base_url}/tabs?userId={USER_ID}"));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let fut = async {
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| CrwError::RendererError(crw_core::error::reqwest_message(e)))?;
+        if !resp.status().is_success() {
+            return Err(CrwError::RendererError(format!(
+                "camofox /tabs list returned {}",
+                resp.status()
+            )));
+        }
+        resp.json::<TabListResponse>()
+            .await
+            .map_err(|e| CrwError::RendererError(format!("camofox /tabs list unreadable: {e}")))
+    };
+    match tokio::time::timeout(CLEANUP_BUDGET, fut).await {
+        Ok(Ok(list)) => Ok(list.tabs),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(CrwError::Timeout(CLEANUP_BUDGET.as_millis() as u64)),
+    }
+}
+
+/// Whether `tab_id` is absent from the server's list — the only real proof a
+/// close worked. `None` means UNKNOWN (the list itself failed), never "gone":
+/// a stalled list must not be reported as a successful close.
+async fn confirm_gone(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    tab_id: &str,
+) -> Option<bool> {
+    let tabs = list_tabs(client, base_url, api_key).await.ok()?;
+    Some(!tabs.iter().any(|t| t.tab_id == tab_id))
+}
+
+/// Log a best-effort close identically in every caller: a client-side timeout
+/// or transport failure is `debug` (the server gives its own close 5 s and
+/// usually finishes anyway — counting those is noise), a rejection is `warn`
+/// (a leak that will really burn a session slot for 30 minutes).
+fn log_close(tab_id: &str, outcome: CloseOutcome) {
+    match outcome {
+        CloseOutcome::Accepted => {
+            tracing::debug!(tab_id, "camofox: tab close accepted (not proof it closed)")
+        }
+        CloseOutcome::Rejected(status) => {
+            tracing::warn!(tab_id, status, "camofox: tab close rejected; tab may leak")
+        }
+        CloseOutcome::Failed(error) => tracing::debug!(
+            tab_id, %error,
+            "camofox: tab close did not complete client-side; server likely still closed it"
+        ),
+        CloseOutcome::TimedOut => tracing::debug!(
+            tab_id,
+            budget_ms = CLEANUP_BUDGET.as_millis() as u64,
+            "camofox: tab close timed out client-side; server likely still closed it"
+        ),
+    }
+}
+
+/// Whether a tab is still sitting on the blank page camofox creates it
+/// on. The reap's second fail-safe: crw always creates blank and navigates
+/// separately, so a tab that has reached a real URL is provably some other
+/// fetch's and is never ours to close.
+fn is_blank_url(url: &str) -> bool {
+    let u = url.trim();
+    u.is_empty() || u.eq_ignore_ascii_case("about:blank")
+}
+
+/// One aggregate budget for a whole reap, held against the caller's
+/// `create_lock`. It has to cover the reap's own steps — the list (which awaits
+/// `page.title()` per tab), the delete, and the confirming re-list, each of
+/// which may use its full [`CLEANUP_BUDGET`] — so it is the sum of them, not a
+/// smaller number that would give up before the last step ever ran and leave
+/// every counter at zero. Without any cap, one wedged camofox could park every
+/// other create behind that much cleanup; note the create-span guard can add a
+/// SECOND reaper behind the same lock, doubling the worst-case queue. Running
+/// out of budget is not a failure — it just means nothing was confirmed, and an
+/// unconfirmed reap counts nothing.
+const REAP_BUDGET: Duration = Duration::from_secs(9);
+
+/// The body of [`CamofoxRenderer::reap_lost_create`], free so the create-span
+/// guard can reach it from a detached task. `create_lock` is held by every
+/// caller — pass it to the guard, which acquires it itself.
+async fn reap_lost_tabs(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    registry: &TabRegistry,
+    cause: &str,
+    detail: &str,
+) {
+    tracing::debug!(
+        cause,
+        detail,
+        "camofox: create answer lost; checking for the orphan tab"
+    );
+    let fut = reap_unknown_blank_tab(client, base_url, api_key, registry, cause);
+    match tokio::time::timeout(REAP_BUDGET, fut).await {
+        Ok(()) => {}
+        Err(_) => tracing::debug!(
+            cause,
+            "camofox: orphan reap ran out of budget; leaving every tab alone"
+        ),
+    }
+}
+
+/// List, decide, close, confirm — every "can't tell" branch closes nothing.
+async fn reap_unknown_blank_tab(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    registry: &TabRegistry,
+    cause: &str,
+) {
+    let listed = match list_tabs(client, base_url, api_key).await {
+        Ok(tabs) => tabs,
+        // Blind: a guess could close another fetch's live tab.
+        Err(e) => {
+            tracing::debug!(
+                cause,
+                error = %e,
+                "camofox: could not list tabs; not reaping"
+            );
+            return;
+        }
+    };
+    let known = registry.snapshot();
+    // Two filters, kept apart so the second one can be noticed: tabs the
+    // registry does not name, and of those, the ones in our own browser context.
+    let mut unknown: Vec<TabInfo> = Vec::new();
+    let mut not_ours = 0usize;
+    for tab in listed {
+        if known.contains(&tab.tab_id) {
+            continue;
+        }
+        // Our own browser context only. `GET /tabs` merges every session of the
+        // `userId`, so without this a tab created under a different `sessionKey`
+        // by anything else sharing that userId could be reaped; and if the
+        // server stops reporting `listItemId` at all, this fails closed.
+        if tab.list_item_id.as_deref() == Some(SESSION_KEY) {
+            unknown.push(tab);
+        } else {
+            not_ours += 1;
+        }
+    }
+    if unknown.is_empty() && not_ours > 0 {
+        // Every candidate was rejected for not reporting our sessionKey. That is
+        // correct when they really belong to another context — but it is also
+        // exactly what a server that stopped emitting `listItemId` looks like,
+        // and that would silently retire this whole mechanism. One warn, because
+        // the alternative is discovering it only as a tab cap nobody can explain.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                not_ours,
+                session_key = SESSION_KEY,
+                "camofox: tabs we do not recognise reported no sessionKey we could claim; not \
+                 reaping. If they are ours, this endpoint no longer reports `listItemId` and \
+                 orphan reaping cannot identify its own tabs"
+            );
+        });
+    }
+    let [orphan] = unknown.as_slice() else {
+        // 0 = our create never registered a tab after all; >1 = ambiguous, and
+        // one of them may be a live fetch.
+        tracing::debug!(
+            cause,
+            unknown = unknown.len(),
+            other_contexts = not_ours,
+            registry = known.len(),
+            "camofox: no single orphan candidate; not reaping"
+        );
+        return;
+    };
+    if !is_blank_url(&orphan.url) {
+        tracing::debug!(
+            tab_id = %orphan.tab_id,
+            url = %orphan.url,
+            "camofox: unknown tab is already navigated; not ours to close"
+        );
+        return;
+    }
+    tracing::warn!(
+        tab_id = %orphan.tab_id,
+        cause,
+        "camofox: reaping tab whose create answer never arrived"
+    );
+    let outcome = send_tab_delete(client, base_url, api_key, &orphan.tab_id).await;
+    // Only an answered close can leave a countable survivor — see `TabGuard`'s
+    // `Drop` for why a client-side timeout is never a leak signal.
+    let answered = matches!(&outcome, CloseOutcome::Accepted | CloseOutcome::Rejected(_));
+    log_close(&orphan.tab_id, outcome);
+    if !answered {
+        return;
+    }
+    match confirm_gone(client, base_url, api_key, &orphan.tab_id).await {
+        Some(true) => crw_core::metrics::metrics()
+            .camofox_tab_leak_total
+            .with_label_values(&[USER_ID, "create-orphan"])
+            .inc(),
+        Some(false) => {
+            tracing::warn!(
+                tab_id = %orphan.tab_id,
+                "camofox: orphan survived the accepted close; it is leaking"
+            );
+            crw_core::metrics::metrics()
+                .camofox_tab_leak_total
+                .with_label_values(&[USER_ID, "close-noop"])
+                .inc();
+        }
+        None => tracing::debug!(
+            tab_id = %orphan.tab_id,
+            "camofox: could not confirm whether the orphan close took effect"
+        ),
+    }
+}
+
+/// Armed for the whole span of a create, so the OTHER way a create can die is
+/// covered too: the fetch future being *dropped* mid-await (the crawl cancel's
+/// `handle.abort()` and the tower outer timeout both do this). camofox registers
+/// the tab server-side before it replies, and a dropped future runs neither the
+/// `Created` arm (nothing registered) nor the `Lost` arm (nothing reaped) — so
+/// without this guard that tab is invisible to every mechanism in this module.
+///
+/// On drop-before-completion it hands the reap to a detached task, which
+/// acquires `create_lock` itself: the reap must serialize against other creates
+/// exactly as the inline one does, or it could close a peer create's blank tab.
+struct CreateGuard {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: Option<String>,
+    registry: TabRegistry,
+    create_lock: Arc<tokio::sync::Mutex<()>>,
+    reap_orphans: bool,
+    /// Cleared once camofox has answered (nothing to reap) or the inline reap
+    /// has run, so `Drop` fires only for a genuinely interrupted create.
+    armed: bool,
+    /// Set the instant a `POST /tabs` is handed to the client, cleared again
+    /// while the loop sleeps between attempts. Without it, a guard dropped
+    /// while parked on the create lock or waiting out a backoff — where the last
+    /// attempt was a 5xx that camofox answered BEFORE registering anything —
+    /// would reap, and count, a tab that provably never existed.
+    sent: bool,
+}
+
+impl CreateGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// The request is in flight: from here, dropping this future can strand a
+    /// tab camofox already registered.
+    fn mark_sent(&mut self) {
+        self.sent = true;
+    }
+
+    /// Backoff between attempts, where nothing is in flight.
+    fn mark_not_sent(&mut self) {
+        self.sent = false;
+    }
+}
+
+impl Drop for CreateGuard {
+    fn drop(&mut self) {
+        // Only a create actually in flight can have registered a tab. An armed
+        // guard that never sent (parked on the lock, asleep between attempts)
+        // has nothing behind it: every pre-registration failure is answered
+        // before camofox commits the tab.
+        if !self.armed || !self.sent {
+            return;
+        }
+        let (client, base_url, api_key, registry, create_lock) = (
+            self.client.clone(),
+            self.base_url.clone(),
+            self.api_key.clone(),
+            self.registry.clone(),
+            Arc::clone(&self.create_lock),
+        );
+        if !self.reap_orphans {
+            // The only trace this leaves on an endpoint we are not allowed to
+            // clean: without it, an operator sees a wedged tab cap and nothing
+            // in the log explains it. Once per process, not once per abort.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "camofox: an interrupted tab create may have left a tab open, and orphan reaping \
+                     is off for this endpoint (it requires `manage = true`); such a tab holds one of \
+                     the session's tab slots until camofox's session timeout"
+                );
+            });
+            return;
+        }
+        tracing::warn!(
+            "camofox: create interrupted by cancellation; reaping any tab it registered"
+        );
+        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+            tracing::warn!("camofox: no runtime to reap an interrupted create");
+            return;
+        };
+        // Counted only now — with a runtime confirmed and a reaper about to run.
+        // The count means "a create was aborted with a request in flight", not
+        // merely "the guard was dropped", and it is emitted where the reap ran:
+        // the tab itself is only counted, separately, if the reap confirms one.
+        crw_core::metrics::metrics()
+            .camofox_tab_leak_total
+            .with_label_values(&[USER_ID, "cancelled"])
+            .inc();
+        handle.spawn(async move {
+            // Same lock the creators hold. Dropped futures cannot take locks, so
+            // this is the one place the reap is entered from outside `create_tab`
+            // — and it still refuses to guess without it.
+            let _serialized = create_lock.lock().await;
+            reap_lost_tabs(
+                &client,
+                &base_url,
+                api_key.as_deref(),
+                &registry,
+                "cancelled create",
+                "the fetch was aborted before the create answer arrived",
+            )
+            .await;
+        });
+    }
+}
+
+/// The result of one `POST /tabs` attempt, told apart by whether camofox ever
+/// ANSWERED — which is what decides if there can be an orphan tab at all.
+enum CreateAttempt {
+    /// Registered and we hold the id.
+    Created(String),
+    /// A 5xx read end to end, retried up to [`CREATE_TAB_ATTEMPTS`].
+    Retryable(String),
+    /// A non-2xx read end to end. camofox answered, and every create failure it
+    /// reports (`window is null`, the consecutive-failure breaker, 429 over
+    /// MAX_TABS_PER_SESSION) is raised BEFORE it registers a tab: nothing to
+    /// reap.
+    Failed(CrwError),
+    /// No usable answer — transport failure, an unreadable body on a 2xx, or
+    /// our own timeout. camofox registers the tab before it replies, so it may
+    /// well exist under an id we never learned. THIS is the leak.
+    Lost(CrwError),
+}
+
+/// Ownership ledger backing the create-orphan reap: the ids of tabs this
+/// process created and has not closed.
+///
+/// Plain `std::sync::Mutex`, deliberately not `tokio::sync::Mutex`: every touch
+/// point is synchronous, which makes it structurally impossible to hold the
+/// guard across an `.await`. Lock ordering is always
+/// [`CamofoxRenderer::create_lock`] → this, never the reverse. Poisoning is
+/// recovered from: a panic between register and unregister can only ever
+/// over-report a tab as live, which makes the reap skip, never mis-close.
+#[derive(Clone, Default)]
+struct TabRegistry(Arc<std::sync::Mutex<HashSet<String>>>);
+
+impl TabRegistry {
+    fn register(&self, tab_id: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(tab_id.to_string());
+    }
+
+    fn unregister(&self, tab_id: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(tab_id);
+    }
+
+    fn snapshot(&self) -> HashSet<String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// Owns one open tab for the life of a fetch so the close survives
+/// CANCELLATION, which is the case plain `.await` cleanup cannot cover.
+///
+/// The fetch future really is dropped in production, at arbitrary awaits: the
+/// crawl cancel path calls `handle.abort()` on the running task
+/// (`crw-server/src/routes/crawl.rs`, `routes/v2/crawl.rs`) and the tower outer
+/// timeout layer drops the handler (`crw-server/src/app.rs`). Both can strand a
+/// tab between `create_tab` and its close. A stranded tab is not self-healing:
+/// camofox's idle cleanup only reaps ZERO-tab sessions, so it holds 1 of the
+/// session's 10 tab slots until the 30 min session timeout — ten of them and
+/// every later create hard-fails 429.
+///
+/// The normal path still closes INLINE via [`TabGuard::close`], never detached:
+/// the create-before-close ordering is load-bearing against camofox's eager
+/// zero-tab context teardown (see `crw-search::camofox_search`'s module docs),
+/// and always-detaching would let a later create race an earlier fetch's close.
+/// Only the cancellation path — where no one is left to await anything — goes
+/// detached.
+struct TabGuard {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: Option<String>,
+    tab_id: String,
+    registry: TabRegistry,
+    /// Disarmed by [`TabGuard::close`] once the inline DELETE has been issued,
+    /// so `Drop` can tell "we already closed it" from "this future was
+    /// cancelled — somebody still has to close it".
+    consumed: bool,
+}
+
+impl TabGuard {
+    fn new(
+        client: reqwest::Client,
+        base_url: String,
+        api_key: Option<String>,
+        tab_id: String,
+        registry: TabRegistry,
+    ) -> Self {
+        Self {
+            client,
+            base_url,
+            api_key,
+            tab_id,
+            registry,
+            consumed: false,
+        }
+    }
+
+    /// Normal path: close inline, preserving today's ordering exactly, and only
+    /// then disarm. Both orderings matter:
+    ///
+    /// * the DELETE is issued while the tab is STILL registered, so a concurrent
+    ///   reap can never mistake a tab with a close in flight for an unregistered
+    ///   candidate (it would double-close it, then count the closing tab as an
+    ///   orphan);
+    /// * disarming happens last, so if this future is cancelled while awaiting
+    ///   its own DELETE the request dies half-sent and the `Drop` impl (still
+    ///   armed) reaps the tab from a detached task instead.
+    async fn close(mut self) {
+        let outcome = send_tab_delete(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_deref(),
+            &self.tab_id,
+        )
+        .await;
+        self.registry.unregister(&self.tab_id);
+        log_close(&self.tab_id, outcome);
+        self.consumed = true;
+    }
+}
+
+impl Drop for TabGuard {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        tracing::warn!(
+            tab_id = %self.tab_id,
+            "camofox: fetch cancelled with the tab open; reaping it detached"
+        );
+        // Clones, not moves: `Drop` hands `&mut self`, and `reqwest::Client`
+        // is internally `Arc`'d, so cloning it costs a refcount bump.
+        let (client, base_url, api_key, tab_id) = (
+            self.client.clone(),
+            self.base_url.clone(),
+            self.api_key.clone(),
+            self.tab_id.clone(),
+        );
+        let registry = self.registry.clone();
+        match tokio::runtime::Handle::try_current() {
+            // Drop cannot await, so the close goes to a detached task. Safe
+            // precisely because this is the cancellation path: no later create
+            // can be ordered against a close nobody was waiting on anyway. The
+            // corollary is the one ordering inversion this design accepts: the
+            // detached DELETE can land AFTER a later fetch's create, so the
+            // context can transiently hit zero tabs and camofox may tear its
+            // window down under the next create — absorbed by
+            // CREATE_TAB_ATTEMPTS rather than pretended away.
+            Ok(handle) => {
+                // Counted in this arm only: the branch below runs no reap, so
+                // counting there would credit a leak-handling path that never
+                // happened.
+                crw_core::metrics::metrics()
+                    .camofox_tab_leak_total
+                    .with_label_values(&[USER_ID, "cancelled"])
+                    .inc();
+                handle.spawn(async move {
+                    let outcome =
+                        send_tab_delete(&client, &base_url, api_key.as_deref(), &tab_id).await;
+                    // Released only now: the tab stays "ours" while its close is
+                    // in flight, so no reap can pick it up as an unknown.
+                    registry.unregister(&tab_id);
+                    // Only an ANSWERED close can leave a survivor worth counting.
+                    // On `TimedOut` the server is likely still inside its own 5 s
+                    // `safePageClose`, so the id would legitimately still be
+                    // listed — counting that would call a documented false alarm
+                    // a leak, on a counter meant to stay empty.
+                    let answered =
+                        matches!(&outcome, CloseOutcome::Accepted | CloseOutcome::Rejected(_));
+                    log_close(&tab_id, outcome);
+                    if answered
+                        && confirm_gone(&client, &base_url, api_key.as_deref(), &tab_id).await
+                            == Some(false)
+                    {
+                        tracing::warn!(
+                            tab_id,
+                            "camofox: cancelled tab survived the accepted close; it is leaking"
+                        );
+                        crw_core::metrics::metrics()
+                            .camofox_tab_leak_total
+                            .with_label_values(&[USER_ID, "close-noop"])
+                            .inc();
+                    }
+                });
+            }
+            // Runtime shutting down: nothing async can run, so this one tab
+            // waits for the 30 min session sweep. Last resort, loud on purpose.
+            // Nothing counted: no reap ran. The ledger is still released — we
+            // are not going to close this tab, and holding the id would make it
+            // invisible to any reap forever.
+            Err(_) => {
+                self.registry.unregister(&self.tab_id);
+                tracing::warn!(
+                    tab_id = %self.tab_id,
+                    "camofox: no runtime to reap the cancelled tab; it waits for the session timeout"
+                );
+            }
+        }
+    }
+}
+
+/// Close the fetch's tab from a normal exit path and disarm the guard, so the
+/// same close cannot fire again from `Drop`. `Option` rather than moving the
+/// guard itself so several exit paths can share it — and an exit path added
+/// later that forgets this call is still leak-free, because the undisarmed
+/// guard reaps on drop.
+async fn close_tab_guard(guard: &mut Option<TabGuard>) {
+    if let Some(guard) = guard.take() {
+        guard.close().await;
+    }
 }
 
 /// `POST /tabs/:id/evaluate` response.
@@ -212,7 +863,9 @@ impl CamofoxRenderer {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             client,
-            create_lock: tokio::sync::Mutex::new(()),
+            create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            known_ids: TabRegistry::default(),
+            reap_orphans: true,
             challenge_wait: DEFAULT_CHALLENGE_WAIT,
             challenge_poll_interval: CHALLENGE_POLL_INTERVAL,
             clearance: None,
@@ -222,6 +875,16 @@ impl CamofoxRenderer {
     /// Enable clearance capture into `cache` (config `clearance_reuse`).
     pub fn with_clearance_cache(mut self, cache: Arc<ClearanceCache>) -> Self {
         self.clearance = Some(cache);
+        self
+    }
+
+    /// Turn the create-orphan reap on or off (config
+    /// `renderer.camofox.reap_orphan_tabs`, default on). Off means a tab whose
+    /// `POST /tabs` response was lost survives until camofox's session timeout
+    /// — the behaviour this reap exists to fix — so it is only for backing the
+    /// reap out if it ever misidentifies a tab.
+    pub fn with_orphan_reap(mut self, enabled: bool) -> Self {
+        self.reap_orphans = enabled;
         self
     }
 
@@ -471,58 +1134,185 @@ impl CamofoxRenderer {
 
     /// Open a blank tab, retrying a 5xx create (see [`CREATE_TAB_ATTEMPTS`]).
     /// Each attempt's send + decode is bounded by the remaining deadline; a
-    /// non-5xx failure surfaces at once. Creates are serialized on
-    /// [`Self::create_lock`].
+    /// non-5xx failure surfaces at once.
+    ///
+    /// Everything here runs inside [`Self::create_lock`] and three invariants
+    /// depend on that, so do not narrow the critical section:
+    ///
+    /// 1. A successful id is registered in [`Self::known_ids`] BEFORE the lock
+    ///    is released. camofox registers a tab server-side before it responds
+    ///    with the id, so an in-flight peer create is already listable —
+    ///    registering under the same lock is what makes "listed but unknown"
+    ///    mean "no IN-PROCESS fetch owns this" (see `reap_lost_create` for the
+    ///    cross-process limitation).
+    /// 2. The orphan reap for a lost create answer ([`Self::reap_lost_create`])
+    ///    runs under that same lock, so no create can start or finish while the
+    ///    reap is deciding.
+    /// 3. [`CreateGuard`] spans the whole call, so the create being cancelled
+    ///    mid-await reaps too — that case reaches no arm of the match below.
     async fn create_tab(&self, deadline: Deadline) -> CrwResult<String> {
         let _serialized = self.create_lock.lock().await;
+        // Armed across the whole create, because the future can be DROPPED
+        // inside the awaits below — an arm of the match cannot see that at all,
+        // and camofox registers the tab before it replies.
+        let mut guard = CreateGuard {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            registry: self.known_ids.clone(),
+            create_lock: Arc::clone(&self.create_lock),
+            reap_orphans: self.reap_orphans,
+            armed: true,
+            sent: false,
+        };
         let body = json!({ "userId": USER_ID, "sessionKey": SESSION_KEY });
         let mut attempt = 1;
         let mut backoff = CREATE_TAB_BACKOFF;
         loop {
             let budget = deadline.remaining();
             if budget.is_zero() {
+                // Nothing sent this iteration, and any earlier attempt was a
+                // 5xx it answered with — a 5xx create registers no tab.
+                guard.disarm();
                 return Err(CrwError::Timeout(deadline.requested_ms()));
             }
             let can_retry = attempt < CREATE_TAB_ATTEMPTS;
             let fut = async {
-                let resp = self.post_json("/tabs", body.clone()).await?;
+                let resp = match self.post_json("/tabs", body.clone()).await {
+                    Ok(resp) => resp,
+                    // No answer at all: the tab may be registered under an id
+                    // we never learned.
+                    Err(e) => return CreateAttempt::Lost(e),
+                };
                 let status = resp.status();
                 if status.is_success() {
-                    return resp
-                        .json::<CreateTabResponse>()
-                        .await
-                        .map(|r| Ok(r.tab_id))
-                        .map_err(|e| {
-                            CrwError::RendererError(format!(
-                                "camofox /tabs bad response: {}",
-                                crw_core::error::reqwest_message(e)
-                            ))
-                        });
+                    return match resp.json::<CreateTabResponse>().await {
+                        Ok(r) => CreateAttempt::Created(r.tab_id),
+                        // A 2xx means camofox DID register the tab; a body we
+                        // cannot read leaves its id unknown. Same leak shape.
+                        Err(e) => CreateAttempt::Lost(CrwError::RendererError(format!(
+                            "camofox /tabs bad response: {}",
+                            crw_core::error::reqwest_message(e)
+                        ))),
+                    };
                 }
                 let detail = error_detail(resp).await;
                 if status.is_server_error() && can_retry {
-                    return Ok(Err(format!("{status}{detail}")));
+                    return CreateAttempt::Retryable(format!("{status}{detail}"));
                 }
-                Err(CrwError::RendererError(format!(
+                CreateAttempt::Failed(CrwError::RendererError(format!(
                     "camofox /tabs returned {status}{detail}"
                 )))
             };
+            // From this statement the request is in flight, so a drop here is
+            // the shape the guard exists for.
+            guard.mark_sent();
             match tokio::time::timeout(budget, fut).await {
-                Ok(Ok(Ok(tab_id))) => return Ok(tab_id),
-                Ok(Ok(Err(transient))) => {
+                Ok(CreateAttempt::Created(tab_id)) => {
+                    // Invariant 1 above.
+                    self.known_ids.register(&tab_id);
+                    guard.disarm();
+                    return Ok(tab_id);
+                }
+                Ok(CreateAttempt::Retryable(transient)) => {
                     tracing::info!(
                         attempt,
                         error = %transient,
                         "camofox: tab create failed, retrying"
                     );
+                    // camofox ANSWERED this attempt, and an answered create
+                    // registers no tab — so during the backoff there is nothing
+                    // for the guard to reap.
+                    guard.mark_not_sent();
                     tokio::time::sleep(backoff.min(deadline.remaining())).await;
                     backoff *= 2;
                     attempt += 1;
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(CrwError::Timeout(budget.as_millis() as u64)),
+                // camofox answered: no tab was registered, nothing to reap.
+                Ok(CreateAttempt::Failed(e)) => {
+                    guard.disarm();
+                    return Err(e);
+                }
+                Ok(CreateAttempt::Lost(e)) => {
+                    self.reap_lost_create("no response", &e).await;
+                    // Only after the reap: a cancellation landing inside it must
+                    // still hand the job to a detached task.
+                    guard.disarm();
+                    return Err(e);
+                }
+                Err(_) => {
+                    let e = CrwError::Timeout(budget.as_millis() as u64);
+                    self.reap_lost_create("client timeout", &e).await;
+                    guard.disarm();
+                    return Err(e);
+                }
             }
         }
+    }
+
+    /// Reap the tab a create left registered-but-unnamed, when `POST /tabs`
+    /// produced no usable answer (the leak `create_tab`'s old comment admitted
+    /// to, and which camofox does NOT clean up: its idle reaper only takes
+    /// ZERO-tab sessions, so the orphan holds 1 of the session's 10 tab slots
+    /// for the full 30 min session timeout).
+    ///
+    /// Only called with [`Self::create_lock`] held, which serializes every
+    /// create and every registration — so a listed id missing from
+    /// [`Self::known_ids`] has no IN-PROCESS owner. Read that qualifier as the
+    /// limitation it is: the ledger is per-process while camofox's tab set is
+    /// per-`userId`, so a SECOND crw process pointed at the same endpoint is
+    /// indistinguishable from us (same `userId`, same `sessionKey`). That is
+    /// why this is off unless crw owns the endpoint — see the `reap_orphans`
+    /// field and `CamofoxEndpoint::reap_orphan_tabs`.
+    ///
+    /// The operating requirement that makes it safe is one crw process per
+    /// `userId` + `sessionKey` per endpoint. `manage` only APPROXIMATES that:
+    /// the supervisor's fast path adopts whatever already answers `/health`
+    /// without starting anything, so two processes both set to `manage = true`
+    /// on the same endpoint both believe they own it, and share `USER_ID` and
+    /// `SESSION_KEY` verbatim. The unknown-id, sessionKey and still-blank checks
+    /// below are what stand in for the ownership we cannot actually prove.
+    ///
+    /// When both reapers run for one create — the inline one below and the
+    /// guard's detached one, behind a cancellation that landed inside the first —
+    /// the second finds the tab already gone and stands down: `create-orphan`
+    /// then counts one LESS than the tabs reaped, and the abort is only visible
+    /// in `cancelled`. Read the two together, never as a per-tab tally.
+    ///
+    /// Three fail-safes still gate the close, because closing the wrong tab
+    /// costs a caller its request while leaving a real orphan only costs a slot:
+    ///
+    /// * exactly ONE unknown id — with two or more we cannot tell ours from a
+    ///   peer's, so close nothing;
+    /// * the tab reports our own `sessionKey` (`listItemId`), so tabs belonging
+    ///   to a different browser context under the same `userId` are never
+    ///   candidates, and a server that stops reporting it is never reaped from;
+    /// * that tab is still BLANK ([`is_blank_url`]) — we create blank and
+    ///   navigate separately, so a tab on a real URL cannot be the one we lost.
+    ///
+    /// Listing is never evidence of anything: `GET /tabs` awaits
+    /// `page.title()` per tab, so a failed or timed-out list means "close
+    /// nothing". And a DELETE being accepted is not proof either (the route
+    /// answers `{ok:true}` even when it matched nothing), so closure is checked
+    /// by re-listing and only a proven survivor is counted `close-noop`.
+    async fn reap_lost_create(&self, cause: &str, err: &CrwError) {
+        if !self.reap_orphans {
+            tracing::debug!(
+                cause,
+                "camofox: orphan reap disabled (endpoint not exclusively owned, or configured off); \
+                 tab may leak until the session timeout"
+            );
+            return;
+        }
+        reap_lost_tabs(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_deref(),
+            &self.known_ids,
+            cause,
+            &err.to_string(),
+        )
+        .await;
     }
 
     /// Navigate an open tab to `url`, send + decode bounded by the remaining
@@ -747,21 +1537,19 @@ impl CamofoxRenderer {
         Ok(html)
     }
 
-    /// Best-effort `DELETE /tabs/{id}` — never fails the caller. Uses a fixed
-    /// grace budget (NOT the deadline, which may already be spent) so a tab
-    /// opened above is still reaped instead of leaking toward MAX_SESSIONS.
-    /// Deadline expiry is the common trigger for this path.
-    async fn close_tab(&self, tab_id: &str) {
-        let _ = tokio::time::timeout(
-            CLEANUP_BUDGET,
-            self.auth(
-                self.client
-                    .delete(format!("{}/tabs/{tab_id}", self.base_url)),
-            )
-            .json(&json!({ "userId": USER_ID }))
-            .send(),
+    /// Take ownership of a freshly created tab so its close survives
+    /// CANCELLATION. Hand every exit path of `fetch` the same `Option` and close
+    /// it with [`close_tab_guard`] before returning; if the future is dropped
+    /// mid-await instead — crawl abort, outer request timeout — the guard's
+    /// `Drop` still reaps the tab, which no `.await`-based cleanup can promise.
+    fn tab_guard(&self, tab_id: String) -> TabGuard {
+        TabGuard::new(
+            self.client.clone(),
+            self.base_url.clone(),
+            self.api_key.clone(),
+            tab_id,
+            self.known_ids.clone(),
         )
-        .await;
     }
 
     /// Fire-and-discard POST bounded by `budget`. The response is dropped
@@ -938,16 +1726,19 @@ impl PageFetcher for CamofoxRenderer {
         }
         let start = Instant::now();
 
-        // 1. Open a tab navigated at `url`. Send + body decode bounded by the
-        //    request budget so a stalled navigate cannot overrun the deadline.
-        //    NOTE: if create succeeds server-side but the response times out here
-        //    we never learn `tab_id`, so that one tab can leak until camofox
-        //    idle-evicts it. Eliminating that race needs the warm-tab+mutex model
-        //    the search client uses (crw-search::camofox_search); tracked as the
-        //    next step, out of scope for the deadline fix.
+        // 1. Open a blank tab, then navigate it separately. Two distinct leaks
+        //    used to live here, and they need two mechanisms: a create whose
+        //    ANSWER was lost leaked the tab it had already registered
+        //    server-side (`create_tab` reaps that under `create_lock`), and a
+        //    create whose FUTURE was dropped mid-await leaked one that no arm of
+        //    that match ever ran (`CreateGuard` reaps that, detached). The tab we
+        //    DID learn the id of goes straight into a [`TabGuard`], so every
+        //    later exit — including this future being cancelled mid-await —
+        //    still closes it.
         let tab_id = self.create_tab(deadline).await?;
+        let mut tab = Some(self.tab_guard(tab_id.clone()));
         if let Err(e) = self.navigate_tab(&tab_id, url, deadline).await {
-            self.close_tab(&tab_id).await;
+            close_tab_guard(&mut tab).await;
             return Err(e);
         }
 
@@ -986,7 +1777,7 @@ impl PageFetcher for CamofoxRenderer {
         //    service was followed). Network-level egress rules are the only
         //    complete control.
         if let Err(e) = self.check_final_url(&tab_id, deadline).await {
-            self.close_tab(&tab_id).await;
+            close_tab_guard(&mut tab).await;
             return Err(e);
         }
 
@@ -1022,8 +1813,10 @@ impl PageFetcher for CamofoxRenderer {
             self.capture_clearance(&tab_id, url, deadline).await;
         }
 
-        // 5. Best-effort close — never fail the fetch on cleanup.
-        self.close_tab(&tab_id).await;
+        // 5. Best-effort close — never fail the fetch on cleanup. Disarms the
+        //    guard; the `html?` below and every earlier exit are covered either
+        //    way.
+        close_tab_guard(&mut tab).await;
 
         let html = html?;
         if html.is_empty() {

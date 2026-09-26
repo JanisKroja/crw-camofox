@@ -57,6 +57,37 @@ pub struct Metrics {
     /// Renderer recycle events, labeled by renderer + reason
     /// (`age` | `count`). Reserved for the optional page-sweep work in B.1.
     pub renderer_recycle_total: IntCounterVec,
+    /// Camofox tabs that outlived their owner, labeled by `renderer` and
+    /// `cause`. Only `crw` (the render tier) is emitted today; `crw-search` is
+    /// reserved for when its warm-tab twin grows the same guard, so a dashboard
+    /// should not expect that series yet.
+    ///
+    /// `cause`:
+    /// - `cancelled`: our own fetch was dropped with a camofox request in
+    ///   flight — either the fetch tab's guard (a tab was open, and the close ran
+    ///   detached from a `Drop`) or a create whose response never arrived, which
+    ///   no response-handling code can observe. It means "an abort left work
+    ///   unfinished and a reaper was dispatched", not "a tab leaked": the tab is
+    ///   counted separately, by `create-orphan`, once a re-list confirms it. A
+    ///   guard dropped where nothing was in flight — between create attempts,
+    ///   after the server answered a failure without registering a tab — counts
+    ///   nothing, and so does a `Drop` with no runtime left to spawn a reaper on.
+    /// - `create-orphan`: `POST /tabs` lost its response so the id was never
+    ///   learned; the tab was found by listing and reaped. Counted only once a
+    ///   re-list confirms the id is gone.
+    /// - `close-noop`: a `DELETE /tabs/{id}` camofox ANSWERED (2xx; it replies
+    ///   `{ok:true}` even for a tab it cannot find, so `DELETE` never 404s) yet
+    ///   the id survived a follow-up list, i.e. the tab is genuinely still open.
+    ///
+    /// Camofox caps a session at `MAX_TABS_PER_SESSION` (10 by default), past
+    /// which `POST /tabs` fails 429, and its idle cleanup only reaps ZERO-tab
+    /// sessions — so a leaked tab pins its context until the 30 min session
+    /// timeout. This counter must stay empty in normal operation. A close that
+    /// merely timed out CLIENT-side is deliberately NOT counted, and neither is
+    /// its survivor check run: camofox gives the close 5 s against our shorter
+    /// budget and Node finishes the handler after the client hangs up, so the id
+    /// would still be listed and counting it would call a false alarm a leak.
+    pub camofox_tab_leak_total: IntCounterVec,
     /// /map URL filter: URLs dropped entirely (Tier A action-URL filter or
     /// parse-error pass-through bookkeeping). Labels: `reason`.
     pub map_filter_dropped_total: IntCounterVec,
@@ -269,6 +300,13 @@ impl Metrics {
             "crw_renderer_recycle_total",
             "Renderer recycle events by renderer and reason",
             &["renderer", "reason"],
+            registry
+        )
+        .unwrap();
+        let camofox_tab_leak_total = register_int_counter_vec_with_registry!(
+            "crw_camofox_tab_leak_total",
+            "Camofox tabs that outlived their owner, by renderer and cause (cancelled/create-orphan/close-noop)",
+            &["renderer", "cause"],
             registry
         )
         .unwrap();
@@ -531,6 +569,7 @@ impl Metrics {
             cdp_live_connections,
             target_lifecycle_total,
             renderer_recycle_total,
+            camofox_tab_leak_total,
             map_filter_dropped_total,
             map_filter_stripped_total,
             map_filter_preserved_total,

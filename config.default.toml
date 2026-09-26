@@ -78,6 +78,27 @@ ws_url = "ws://127.0.0.1:9222/"
 # api_key = "..."                 # only if the camofox server runs with auth
 # challenge_wait_ms = 20000       # wait for a Cloudflare "Just a moment" page to clear; 0 = off
 # clearance_reuse = true          # cache cf_clearance + UA per host, reuse on the HTTP tier
+# reap_orphan_tabs = true         # close the tab a `POST /tabs` registered server-side but
+#                                 # never told us about (its answer lost to a timeout, a
+#                                 # disconnect, or the request being cancelled mid-create).
+#                                 # Left alone it holds one of the session's 10 tab slots for
+#                                 # the full 30 min session timeout — camofox's idle reaper
+#                                 # only collects ZERO-tab sessions — and 10 of them make every
+#                                 # create fail 429. The reap only acts when it can list tabs
+#                                 # AND finds exactly one it never registered AND that tab
+#                                 # reports crw's own sessionKey AND it is still about:blank.
+#                                 # Only effective together with `manage = true` below: the
+#                                 # "what I registered" ledger is per-process while camofox
+#                                 # keys tabs by userId, so against an EXTERNAL endpoint a
+#                                 # second crw process sharing the userId would look like an
+#                                 # orphan and reaping would close its live tab.
+#                                 # manage = true is the proxy for ownership, not its proof —
+#                                 # an already-running camofox is adopted without being
+#                                 # started, so two crw servers on one endpoint both think it
+#                                 # is theirs. Run ONE crw per userId+sessionKey per camofox.
+#                                 # Set false as the escape hatch
+#                                 # (CRW_RENDERER__CAMOFOX__REAP_ORPHAN_TABS=false).
+#                                 # Reaps count crw_camofox_tab_leak_total{cause="create-orphan"}.
 # manage = true                   # NATIVE MODE (single machine, no Docker): crw owns the
 #                                 # endpoint lifecycle — lazy-wakes a host-local
 #                                 # `camofox-browser` (PATH, or `npx -y
