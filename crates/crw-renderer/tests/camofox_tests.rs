@@ -554,6 +554,7 @@ async fn render_js_true_escalates_when_http_tier_fails() {
             api_key: None,
             challenge_wait_ms: 20_000,
             clearance_reuse: true,
+            manage: false,
         }),
         http_timeout_ms: Some(300),
         ..Default::default()

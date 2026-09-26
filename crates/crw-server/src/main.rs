@@ -13,7 +13,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Download LightPanda and create a local config for JS rendering
-    Setup,
+    Setup {
+        /// Also pre-warm the managed Camofox stack: start the pinned
+        /// camofox-browser server once (downloading the Camoufox engine on
+        /// first run, ~300 MB) and tear it down again, so the first real
+        /// request after `manage = true` starts warm. Requires the `camofox`
+        /// build profile (the published image and native macOS builds have it).
+        #[arg(long)]
+        camofox: bool,
+    },
 }
 
 #[tokio::main]
@@ -25,8 +33,8 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Setup) => {
-            crw_server::setup::run_setup().await;
+        Some(Commands::Setup { camofox }) => {
+            crw_server::setup::run_setup(camofox).await;
         }
         None => {
             run_server().await;
@@ -45,8 +53,10 @@ async fn run_server() {
     // Eagerly register Prometheus metrics so alert rules see present series at boot.
     crw_core::metrics::init();
 
-    // Load configuration.
-    let config = match AppConfig::load() {
+    // Load configuration. The mut is only consumed by the managed-browser
+    // injection below, which is camofox-gated — silence it elsewhere.
+    #[cfg_attr(not(feature = "camofox"), allow(unused_mut))]
+    let mut config = match AppConfig::load() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to load configuration: {e}");
@@ -128,10 +138,48 @@ async fn run_server() {
         std::process::exit(1);
     }
 
+    // Native local mode (`[renderer] manage_browsers = true`): obtain and
+    // hold the embedded LightPanda before the renderer is built, feeding its
+    // dynamic ws_url into the config the FallbackRenderer will pin its tier
+    // to. Camofox is NOT woken here — it lazy-wakes per request via the
+    // supervisor gate, which is where the idle-RAM win lives. The guards live
+    // for the whole server lifetime; ManagedBrowser::Drop + the final
+    // kill_all_browsers() below reap the tree on graceful shutdown.
+    #[cfg(feature = "camofox")]
+    let mut _managed_browsers: Vec<crw_renderer::browser::ManagedBrowser> = Vec::new();
+    #[cfg(feature = "camofox")]
+    if config.renderer.manage_browsers
+        && crw_renderer::browser::lightpanda_should_be_managed(
+            config
+                .renderer
+                .lightpanda
+                .as_ref()
+                .map(|e| e.ws_url.as_str()),
+        )
+        .await
+    {
+        match crw_renderer::browser::spawn_lightpanda_embedded().await {
+            Some((guard, ws_url)) => {
+                tracing::info!("managed LightPanda CDP endpoint: {ws_url}");
+                config.renderer.lightpanda = Some(crw_core::config::CdpEndpoint { ws_url });
+                _managed_browsers.push(guard);
+            }
+            None => tracing::warn!(
+                "[renderer] manage_browsers = true but no LightPanda binary could be \
+                 obtained (PATH, ~/.crw/lightpanda, or auto-download); the light JS \
+                 tier is unavailable and the ladder will start at the Camofox tier"
+            ),
+        }
+    }
+
     let state = match AppState::new(config) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("Failed to build application state: {e}");
+            // Drop does not run under process::exit: sweep the browser
+            // process-group registry (managed LightPanda may be spawned).
+            #[cfg(feature = "camofox")]
+            crw_renderer::browser::kill_all_browsers();
             std::process::exit(1);
         }
     };
@@ -174,6 +222,9 @@ async fn run_server() {
     let renderer = std::sync::Arc::clone(&state.renderer);
     let pool_drain =
         std::time::Duration::from_secs(state.config.renderer.chrome_pool.shutdown_drain_secs);
+    // Managed-camofox supervisor handle, for the teardown path below.
+    #[cfg(feature = "camofox")]
+    let managed_state = state.clone();
 
     let app = crw_server::app::create_app(state);
 
@@ -181,6 +232,8 @@ async fn run_server() {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("Failed to bind to {addr}: {e}");
+            #[cfg(feature = "camofox")]
+            crw_renderer::browser::kill_all_browsers();
             std::process::exit(1);
         }
     };
@@ -191,11 +244,27 @@ async fn run_server() {
 
     if let Err(e) = server.await {
         tracing::error!("Server error: {e}");
+        #[cfg(feature = "camofox")]
+        crw_renderer::browser::kill_all_browsers();
         std::process::exit(1);
     }
 
     // HTTP layer is quiesced; now drain the chrome pool (no-op when disabled).
     renderer.shutdown_chrome_pool(pool_drain).await;
+
+    // Native local mode teardown: stop the managed camofox server (group-kill
+    // → Node server + every Camoufox/Firefox grandchild), then sweep the
+    // whole browser process-group registry, which also covers the managed
+    // LightPanda whose guard drops below. Belt-and-braces because the
+    // supervisor's child is registered in the same registry a signal-exit
+    // path would rely on, and Drop does not run under `process::exit`.
+    #[cfg(feature = "camofox")]
+    {
+        if let Some(sup) = &managed_state.camofox_supervisor {
+            sup.stop().await;
+        }
+        crw_renderer::browser::kill_all_browsers();
+    }
 
     tracing::info!("Server shut down gracefully");
 }

@@ -586,6 +586,17 @@ pub struct RendererConfig {
     /// LightPanda. See [`CamofoxEndpoint`].
     #[serde(default)]
     pub camofox: Option<CamofoxEndpoint>,
+    /// Native/local mode master switch: crw spawns and supervises the browser
+    /// tiers it can run as host processes itself (today: the LightPanda tier,
+    /// when no external `[renderer.lightpanda] ws_url` is configured) instead
+    /// of expecting them to be running elsewhere. Camofox has its own per
+    /// endpoint switch ([`CamofoxEndpoint::manage`]). Designed for
+    /// single-machine local use (the Docker-free macOS path); container
+    /// deployments keep the default `false` and bring their own sidecars.
+    /// Requires the binary's `camofox`/browser-management build profile
+    /// (the published image and `crw-cli` have it); ignored otherwise.
+    #[serde(default)]
+    pub manage_browsers: bool,
     /// Byparr challenge-solver tier, tried after every other JS tier and only
     /// on an anti-bot challenge. See [`ByparrEndpoint`].
     #[serde(default)]
@@ -848,6 +859,7 @@ impl Default for RendererConfig {
             playwright: None,
             chrome: None,
             camofox: None,
+            manage_browsers: false,
             byparr: None,
             impersonated: ImpersonatedConfig::default(),
             chrome_proxy: None,
@@ -1053,6 +1065,20 @@ pub struct CamofoxEndpoint {
     /// them and skip the browser on the next scrape of that host.
     #[serde(default = "default_clearance_reuse")]
     pub clearance_reuse: bool,
+    /// Take over the lifecycle of the camofox-browser server at `base_url`.
+    /// When true, crw probes `GET /health` before each Camofox-tier request
+    /// and search call and — when nothing answers — spawns the server itself
+    /// as a host-local process (`camofox-browser` on PATH, else
+    /// `npx -y camofox-browser@<pin>`; override the executable with
+    /// `CRW_CAMOFOX_BROWSER_BIN`, the pin with `CRW_CAMOFOX_BROWSER_VERSION`).
+    /// The spawned server binds loopback only with auth disabled and joins
+    /// the browser process-group registry, so shutdown/signal paths reap it
+    /// together with its Firefox children. A server that already answers
+    /// `/health` (a second crw instance, a leftover daemon) is adopted rather
+    /// than duplicated. Needs a binary built with the server's `camofox`
+    /// feature; ignored otherwise (the endpoint is then treated as external).
+    #[serde(default)]
+    pub manage: bool,
 }
 
 fn default_challenge_wait_ms() -> u64 {
@@ -1691,6 +1717,10 @@ mod tests {
             toml::from_str("base_url = \"http://camofox:9377\"").expect("minimal endpoint parses");
         assert_eq!(ep.challenge_wait_ms, 20_000);
         assert!(ep.clearance_reuse);
+        assert!(
+            !ep.manage,
+            "managed lifecycle must never be a silent default"
+        );
 
         let ep: CamofoxEndpoint = toml::from_str(
             "base_url = \"http://camofox:9377\"\nchallenge_wait_ms = 0\nclearance_reuse = false",
@@ -1698,6 +1728,24 @@ mod tests {
         .expect("explicit values parse");
         assert_eq!(ep.challenge_wait_ms, 0);
         assert!(!ep.clearance_reuse);
+    }
+
+    #[test]
+    fn camofox_endpoint_manage_and_renderer_manage_browsers_parse() {
+        let ep: CamofoxEndpoint =
+            toml::from_str("base_url = \"http://127.0.0.1:9377\"\nmanage = true")
+                .expect("managed endpoint parses");
+        assert!(ep.manage);
+
+        let cfg: RendererConfig =
+            toml::from_str("manage_browsers = true").expect("manage_browsers parses");
+        assert!(cfg.manage_browsers);
+
+        let cfg: RendererConfig = toml::from_str("").expect("default renderer config");
+        assert!(
+            !cfg.manage_browsers,
+            "embedded browser management must never be a silent default"
+        );
     }
 
     #[test]

@@ -1,0 +1,20 @@
+# Acceptance config for native (Docker-free) mode — see docs/docs/native-macos.md
+[server]
+host = "127.0.0.1"
+port = 3600
+
+[renderer]
+mode = "auto"
+manage_browsers = true
+
+[renderer.camofox]
+base_url = "http://127.0.0.1:9377"
+manage = true
+challenge_wait_ms = 20000
+clearance_reuse = true
+
+[search]
+enabled = true
+timeout_ms = 60000
+default_limit = 5
+max_limit = 20

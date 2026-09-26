@@ -95,10 +95,40 @@ pub async fn run(args: ServeArgs) {
         std::process::exit(1);
     }
 
+    // Native local mode (see server main.rs / docs/docs/native-macos.md):
+    // spawn the managed LightPanda and inject its ws_url before the renderer
+    // is built. Camofox (`[renderer.camofox] manage`) lazy-wakes per request
+    // through the AppState gate, not here.
+    let mut _managed_browsers: Vec<crw_renderer::browser::ManagedBrowser> = Vec::new();
+    if config.renderer.manage_browsers
+        && crw_renderer::browser::lightpanda_should_be_managed(
+            config
+                .renderer
+                .lightpanda
+                .as_ref()
+                .map(|e| e.ws_url.as_str()),
+        )
+        .await
+    {
+        match crw_renderer::browser::spawn_lightpanda_embedded().await {
+            Some((guard, ws_url)) => {
+                tracing::info!("managed LightPanda CDP endpoint: {ws_url}");
+                config.renderer.lightpanda = Some(crw_core::config::CdpEndpoint { ws_url });
+                _managed_browsers.push(guard);
+            }
+            None => tracing::warn!(
+                "[renderer] manage_browsers = true but no LightPanda binary could be \
+                 obtained (PATH, ~/.crw/lightpanda, or auto-download); the light JS \
+                 tier is unavailable and the ladder will start at the Camofox tier"
+            ),
+        }
+    }
+
     let state = match AppState::new(config) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("Failed to build application state: {e}");
+            crw_renderer::browser::kill_all_browsers();
             std::process::exit(1);
         }
     };
@@ -157,6 +187,10 @@ pub async fn run(args: ServeArgs) {
 
     // HTTP layer is quiesced; now drain the chrome pool
     renderer.shutdown_chrome_pool(pool_drain).await;
+
+    // Managed browser processes (light tier guard + any camofox supervisor
+    // children registered by AppState) — sweep the process-group registry.
+    crw_renderer::browser::kill_all_browsers();
 
     tracing::info!("Server shut down gracefully");
 }

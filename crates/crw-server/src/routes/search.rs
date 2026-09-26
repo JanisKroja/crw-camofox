@@ -259,6 +259,11 @@ pub async fn search_inner(
         })?
         .clone();
 
+    // Managed camofox (`manage = true`): search bypasses the render ladder,
+    // so this route — not the ladder gate — owns waking the host-local
+    // server for it. No-op for external endpoints.
+    state.ensure_camofox_ready().await?;
+
     let limit = req
         .limit
         .unwrap_or(state.config.search.default_limit)

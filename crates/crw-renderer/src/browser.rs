@@ -33,8 +33,11 @@ fn lock_pgids() -> std::sync::MutexGuard<'static, HashSet<i32>> {
 
 /// Register a freshly-spawned child's process group. Returns the pgid to
 /// store on the guard, or `None` if the child already exited (no panic).
+/// `pub(crate)`: the managed camofox supervisor registers its spawned
+/// server through the same registry so one teardown path reaps every
+/// browser the process launched (server + its Firefox children).
 #[cfg(unix)]
-fn register_child(child: &Child) -> Option<i32> {
+pub(crate) fn register_child(child: &Child) -> Option<i32> {
     let pgid = child.id()? as i32;
     lock_pgids().insert(pgid);
     tracing::debug!(pgid, "registered browser process group");
@@ -42,17 +45,28 @@ fn register_child(child: &Child) -> Option<i32> {
 }
 
 #[cfg(not(unix))]
-fn register_child(_child: &Child) -> Option<i32> {
+pub(crate) fn register_child(_child: &Child) -> Option<i32> {
     None
 }
 
 /// Drop a pgid from the registry the moment its group leader is reaped, so
 /// the set does not hold stale pgids across a normal browser lifetime
-/// (PID-reuse mitigation).
+/// (PID-reuse mitigation). `pub(crate)` for the managed camofox supervisor.
 #[cfg(unix)]
-fn deregister_pgid(pgid: i32) {
+pub(crate) fn deregister_pgid(pgid: i32) {
     lock_pgids().remove(&pgid);
     tracing::debug!(pgid, "deregistered browser process group");
+}
+
+/// SIGKILL one registered process group (supervisor teardown after a failed
+/// or unwanted launch). Deregistering is the caller's job — kept separate so
+/// a kill that races the group leader's own exit still cannot leave the pgid
+/// in the registry.
+#[cfg(unix)]
+pub(crate) fn kill_pgid(pgid: i32) {
+    // SAFETY: killpg is async-signal-safe; same accepted PID-reuse race as
+    // `kill_all_browsers` above.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
 }
 
 /// SIGKILL every still-registered browser process group. Idempotent and
@@ -568,7 +582,7 @@ async fn read_ws_url_from_stderr(stderr: tokio::process::ChildStderr) -> Option<
     .flatten()
 }
 
-fn find_in_path(name: &str) -> Option<String> {
+pub(crate) fn find_in_path(name: &str) -> Option<String> {
     std::process::Command::new("which")
         .arg(name)
         .output()
@@ -577,6 +591,49 @@ fn find_in_path(name: &str) -> Option<String> {
         .map(|_| name.to_string())
 }
 
-fn command_exists(name: &str) -> bool {
+pub(crate) fn command_exists(name: &str) -> bool {
     find_in_path(name).is_some()
+}
+
+/// Public entry to the embedded native-LightPanda launch path for managed
+/// server mode (`[renderer] manage_browsers = true`): spawns the local
+/// LightPanda binary (PATH → `~/.crw/lightpanda` → auto-download) and returns
+/// its guard plus the `ws://` URL to feed `[renderer.lightpanda].ws_url`.
+/// `None` when the binary cannot be obtained (unsupported platform, offline
+/// first run) — callers must fall back gracefully, as the CLI ladder does.
+pub async fn spawn_lightpanda_embedded() -> Option<(ManagedBrowser, String)> {
+    try_lightpanda_native().await
+}
+
+/// The `[renderer.lightpanda].ws_url` shipped in `config.default.toml`.
+/// `config.default.toml` merges under every deployment, so "the key is
+/// absent" never happens and the managed-mode gate must instead recognize
+/// the untouched default (see [`lightpanda_should_be_managed`]).
+pub const DEFAULT_LIGHTPANDA_WS: &str = "ws://127.0.0.1:9222/";
+
+/// Whether `manage_browsers = true` should spawn a managed LightPanda for
+/// this config, given the effective (post-merge) `[renderer.lightpanda]`
+/// ws_url:
+/// * `None` ⇒ managed (explicitly opted into by omitting the endpoint).
+/// * the untouched default ⇒ managed **only if nothing is already listening**
+///   on 127.0.0.1:9222 — something serving the default port (an operator's
+///   own lightpanda, an orphan from a previous run) is treated as external.
+/// * any other URL ⇒ external by definition: the operator pointed crw at a
+///   browser elsewhere and `manage_browsers` governs only the tiers crw can
+///   run locally.
+pub async fn lightpanda_should_be_managed(ws_url: Option<&str>) -> bool {
+    match ws_url {
+        None => true,
+        Some(DEFAULT_LIGHTPANDA_WS) => {
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                tokio::net::TcpStream::connect("127.0.0.1:9222"),
+            )
+            .await;
+            // Connection refused / timeout ⇒ port dark ⇒ managed. Ok(_) ⇒
+            // live server present ⇒ external.
+            !matches!(probe, Ok(Ok(_)))
+        }
+        Some(_) => false,
+    }
 }

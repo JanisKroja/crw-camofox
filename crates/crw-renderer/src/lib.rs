@@ -42,6 +42,8 @@ pub mod browser_pool;
 pub mod byparr;
 #[cfg(feature = "camofox")]
 pub mod camofox;
+#[cfg(feature = "auto-browser")]
+pub mod camofox_supervisor;
 #[cfg(feature = "cdp")]
 pub mod cdp;
 #[cfg(feature = "cdp")]
@@ -456,6 +458,14 @@ pub struct FallbackRenderer {
     /// `None` when the pool is disabled or the chrome tier isn't configured.
     #[cfg(feature = "cdp")]
     chrome_pool: Option<Arc<browser_pool::BrowserContextPool<cdp_conn::CdpConnection>>>,
+    /// Lifecycle owner for a host-managed camofox-browser server
+    /// (`[renderer.camofox] manage = true`). When set, the ladder calls
+    /// `ensure_ready` before dispatching to the Camofox tier so the tier is
+    /// woken on first use, adopted if already running, and respawned after a
+    /// crash or camofox's own idle daemon exit. `None` = the endpoint is
+    /// external (the container deployment contract).
+    #[cfg(feature = "auto-browser")]
+    camofox_gate: Option<Arc<camofox_supervisor::CamofoxSupervisor>>,
 }
 
 impl std::fmt::Debug for FallbackRenderer {
@@ -567,6 +577,8 @@ impl FallbackRenderer {
                 impersonated,
                 #[cfg(feature = "cdp")]
                 chrome_pool: None,
+                #[cfg(feature = "auto-browser")]
+                camofox_gate: None,
             });
         }
 
@@ -684,7 +696,52 @@ impl FallbackRenderer {
             impersonated,
             #[cfg(feature = "cdp")]
             chrome_pool,
+            #[cfg(feature = "auto-browser")]
+            camofox_gate: None,
         })
+    }
+
+    /// Install the managed-camofox supervisor ([`CamofoxSupervisor`],
+    /// `[renderer.camofox] manage = true`). Kept as a builder rather than a
+    /// `new()` parameter: the supervisor is only meaningful for a host-local
+    /// deployment, the container path never constructs one, and the ladder
+    /// gate below keys off exactly this being `Some`.
+    #[cfg(feature = "auto-browser")]
+    pub fn with_camofox_gate(mut self, gate: Arc<camofox_supervisor::CamofoxSupervisor>) -> Self {
+        self.camofox_gate = Some(gate);
+        self
+    }
+
+    /// Managed-camofox pre-dispatch gate for the JS ladder loops.
+    ///
+    /// `None` = nothing to do (not the Camofox tier, or the endpoint is
+    /// external — the container contract, zero added latency).
+    /// `Some(Err(_))` = the managed server could not be brought up inside
+    /// the request budget, so the caller must treat this tier attempt as
+    /// failed (fed to the same breaker/error path a tier ConnectionError
+    /// takes). `Some(Ok(()))` = woken/adopted, proceed to `fetch`.
+    #[cfg(feature = "auto-browser")]
+    async fn gate_before_tier(
+        &self,
+        tier: &str,
+        deadline: crw_core::Deadline,
+    ) -> Option<CrwResult<()>> {
+        if tier != "camofox" {
+            return None;
+        }
+        let gate = self.camofox_gate.as_ref()?;
+        Some(gate.ensure_ready(deadline.remaining()).await)
+    }
+
+    /// Non-managed builds never spawn anything: the Camofox endpoint is
+    /// external by contract there.
+    #[cfg(not(feature = "auto-browser"))]
+    async fn gate_before_tier(
+        &self,
+        _tier: &str,
+        _deadline: crw_core::Deadline,
+    ) -> Option<CrwResult<()>> {
+        None
     }
 
     /// True when a JS renderer (lightpanda / camofox) is wired in, so a
@@ -1783,7 +1840,16 @@ impl FallbackRenderer {
                     .unwrap_or(remaining);
                 AttemptContext::capture(remaining, tier_budget)
             };
-            match renderer.fetch(url, headers, wait_for_ms, deadline).await {
+            // Managed camofox: wake/adopt/respawn the host-local server
+            // before spending this tier's budget (no-op unless this is the
+            // camofox tier AND a supervisor was installed — the container
+            // path never installs one). A failure here is reported exactly
+            // like a tier connection failure below: the breaker must see it.
+            let fetch_res = match self.gate_before_tier(renderer.name(), deadline).await {
+                Some(Err(e)) => Err(e),
+                _ => renderer.fetch(url, headers, wait_for_ms, deadline).await,
+            };
+            match fetch_res {
                 Ok(mut result) => {
                     let body = JsBodyChecks::assess(&result, &self.antibot);
                     let accepted = body.accepted();
@@ -2132,7 +2198,10 @@ impl FallbackRenderer {
                     let tier_budget = self.tier_timeouts.get(&k).copied().unwrap_or(remaining);
                     AttemptContext::capture(remaining, tier_budget)
                 };
-                let res = renderer.fetch(url, headers, wait_for_ms, deadline).await;
+                let res = match self.gate_before_tier(renderer.name(), deadline).await {
+                    Some(Err(e)) => Err(e),
+                    _ => renderer.fetch(url, headers, wait_for_ms, deadline).await,
+                };
                 match res {
                     Ok(mut result) => {
                         let body = JsBodyChecks::assess(&result, &self.antibot);
@@ -2522,6 +2591,7 @@ mod tests {
                 api_key: None,
                 challenge_wait_ms: 5_000,
                 clearance_reuse: false,
+                manage: false,
             }),
             ..Default::default()
         };
@@ -2586,6 +2656,7 @@ mod tests {
                     api_key: None,
                     challenge_wait_ms: 20_000,
                     clearance_reuse: true,
+                    manage: false,
                 }),
                 ..Default::default()
             }),

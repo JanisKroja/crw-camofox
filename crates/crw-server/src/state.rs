@@ -171,6 +171,13 @@ pub struct AppState {
     /// no Camofox renderer is configured; `/v1/search` then returns a clear
     /// `search_disabled` error.
     pub search: Option<SearchBackend>,
+    /// Lifecycle owner for a host-managed camofox-browser server
+    /// (`[renderer.camofox] manage = true`). Present exactly when the same
+    /// config flag is set on the camofox endpoint — the renderer's ladder gate
+    /// and the search route both key off it, container deployments never
+    /// construct one. `None` = endpoint is external.
+    #[cfg(feature = "camofox")]
+    pub camofox_supervisor: Option<Arc<crw_renderer::camofox_supervisor::CamofoxSupervisor>>,
     /// Server-wide default /map URL filter. `None` disables the filter
     /// entirely (legacy behaviour). Per-request overrides may swap or
     /// extend this at handler time.
@@ -190,6 +197,48 @@ impl AppState {
             config.crawler.requests_per_second,
             config.crawler.per_host_max_concurrent,
         );
+
+        // Managed camofox (`[renderer.camofox] manage = true`): crw owns the
+        // endpoint's lifecycle — lazy wake on first Camofox-tier request or
+        // search, adoption of an already-healthy server, respawn after a
+        // crash or camofox's idle daemon exit. Loopback-only on purpose: a
+        // managed server we spawn binds 127.0.0.1, so pointing `base_url` at
+        // anything else is a misconfiguration, not something to paper over.
+        #[cfg(feature = "camofox")]
+        let camofox_supervisor = match config.renderer.camofox.as_ref() {
+            Some(cf) if cf.manage => {
+                let host_ok = cf
+                    .base_url
+                    .split("://")
+                    .nth(1)
+                    .and_then(|r| r.split('/').next())
+                    .and_then(|a| a.rsplit_once(':').map(|(h, _)| h).or(Some(a)))
+                    .is_some_and(|h| h == "127.0.0.1" || h == "localhost" || h == "[::1]");
+                if !host_ok {
+                    return Err(CrwError::ConfigError(format!(
+                        "[renderer.camofox] manage = true requires a loopback base_url \
+                         (http://127.0.0.1:PORT), got {:?}",
+                        cf.base_url
+                    )));
+                }
+                tracing::info!(
+                    base_url = %cf.base_url,
+                    "camofox endpoint is managed: lazy-waking the host-local server on first use",
+                );
+                Some(Arc::new(
+                    crw_renderer::camofox_supervisor::CamofoxSupervisor::new(
+                        cf.base_url.clone(),
+                        cf.api_key.clone(),
+                    ),
+                ))
+            }
+            _ => None,
+        };
+        #[cfg(feature = "camofox")]
+        let renderer = match camofox_supervisor.as_ref() {
+            Some(gate) => renderer.with_camofox_gate(Arc::clone(gate)),
+            None => renderer,
+        };
 
         // Camofox-direct search. When `[renderer.camofox]` is set, `/v1/search`
         // drives Google through the camofox-browser tier (SERPs trip anti-bot
@@ -243,6 +292,8 @@ impl AppState {
             extract_jobs: Arc::new(RwLock::new(HashMap::new())),
             crawl_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CRAWLS)),
             search,
+            #[cfg(feature = "camofox")]
+            camofox_supervisor,
             url_filter,
         };
 
@@ -283,6 +334,37 @@ impl AppState {
         });
 
         Ok(state)
+    }
+
+    /// Bring the managed camofox endpoint up before a search call (the
+    /// render-ladder path gates inside `FallbackRenderer` itself; search
+    /// bypasses the ladder, so it gates here). A no-op unless
+    /// `[renderer.camofox] manage = true`. Budget: the supervisor's
+    /// cold-start allowance (first run on a fresh machine downloads the
+    /// Camoufox engine); warm calls are one `/health` round-trip. Takes no
+    /// caller budget and references no camofox types outside the feature —
+    /// the default (non-camofox) build keeps compiling.
+    pub async fn ensure_camofox_ready(&self) -> CrwResult<()> {
+        #[cfg(feature = "camofox")]
+        if let Some(sup) = &self.camofox_supervisor {
+            return sup
+                .ensure_ready(crw_renderer::camofox_supervisor::DEFAULT_COLD_START)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// True when the camofox endpoint lifecycle is owned by this process
+    /// (`manage = true`); used by diagnostics/tests to assert the mode.
+    pub fn camofox_managed(&self) -> bool {
+        #[cfg(feature = "camofox")]
+        {
+            self.camofox_supervisor.is_some()
+        }
+        #[cfg(not(feature = "camofox"))]
+        {
+            false
+        }
     }
 
     /// Start a new crawl job and return its UUID.
@@ -624,5 +706,68 @@ impl AppState {
         });
 
         id
+    }
+}
+
+#[cfg(all(test, feature = "camofox"))]
+mod managed_camofox_tests {
+    use super::*;
+
+    fn config_with(camofox_toml: &str) -> AppConfig {
+        toml::from_str(&format!("[renderer.camofox]\n{camofox_toml}")).expect("config parses")
+    }
+
+    /// `manage = true` on a loopback endpoint: AppState constructs the
+    /// supervisor AND installs it as the renderer's ladder gate — the two
+    /// consumers (search route + `FallbackRenderer`) key off exactly this.
+    #[tokio::test]
+    async fn managed_loopback_endpoint_installs_the_supervisor() {
+        let state = AppState::new(config_with(
+            "base_url = \"http://127.0.0.1:9377\"\nmanage = true",
+        ))
+        .expect("state builds");
+        assert!(state.camofox_managed());
+        // ensure_camofox_ready is wired (it would probe; assert the
+        // no-supervisor path of the same fn below instead of hitting net).
+    }
+
+    /// The container contract: an endpoint without `manage` is external.
+    #[tokio::test]
+    async fn unmanaged_endpoint_stays_external() {
+        let state =
+            AppState::new(config_with("base_url = \"http://camofox:9377\"")).expect("state builds");
+        assert!(!state.camofox_managed());
+        // And the gate is a no-op for it (would Err via a dead probe if it
+        // ever tried to spawn).
+        state
+            .ensure_camofox_ready()
+            .await
+            .expect("no-op without a supervisor");
+    }
+
+    /// A managed server binds loopback — a non-loopback `base_url` with
+    /// `manage = true` is a misconfiguration and must be refused at boot,
+    /// not silently half-managed.
+    #[tokio::test]
+    async fn managed_endpoint_must_be_loopback() {
+        let err = match AppState::new(config_with(
+            "base_url = \"http://10.0.0.5:9377\"\nmanage = true",
+        )) {
+            Ok(_) => panic!("non-loopback managed endpoint must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, CrwError::ConfigError(m) if m.contains("loopback")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn localhost_and_loopback_v6_forms_are_accepted() {
+        for url in ["http://localhost:9377", "http://[::1]:9377"] {
+            let state = AppState::new(config_with(&format!("base_url = \"{url}\"\nmanage = true")))
+                .expect("loopback form accepted");
+            assert!(state.camofox_managed(), "{url} not managed");
+        }
     }
 }

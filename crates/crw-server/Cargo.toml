@@ -13,8 +13,12 @@ description = "Firecrawl-compatible API server for the CRW web scraper"
 default = []
 cdp = ["crw-renderer/cdp"]
 # Camofox (camofox-browser REST) renderer tier. The runtime wiring lives in the
-# cdp-gated renderer ladder, so enable it together with `cdp`.
-camofox = ["crw-renderer/camofox", "cdp"]
+# cdp-gated renderer ladder, so enable it together with `cdp`. Also pulls the
+# renderer's `auto-browser` profile: `[renderer.camofox] manage` and
+# `[renderer] manage_browsers` (native local mode) spawn and supervise the
+# browser processes, which needs the embedded launcher in crw-renderer. The
+# management is config-off by default, so the container image is unaffected.
+camofox = ["crw-renderer/camofox", "crw-renderer/auto-browser", "cdp"]
 # Chrome-impersonation HTTP tier (wreq). Default OFF; the Docker image turns it on.
 impersonated = ["crw-renderer/impersonated"]
 test-utils = []

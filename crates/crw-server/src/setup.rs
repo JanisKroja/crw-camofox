@@ -8,7 +8,12 @@ const LIGHTPANDA_BASE_URL: &str =
     "https://github.com/lightpanda-io/browser/releases/download/nightly";
 
 /// Run the interactive setup: download LightPanda binary and create config.
-pub async fn run_setup() {
+/// With `prewarm_camofox`, additionally boot the managed camofox-browser
+/// server once — which downloads the pinned Camoufox engine (a few hundred
+/// MB on first run) — and tear it down again, so the first real request with
+/// `[renderer.camofox] manage = true` starts warm instead of spending its
+/// budget on the engine download.
+pub async fn run_setup(prewarm_camofox: bool) {
     println!();
     let (os_label, arch_label, binary_name) = match (OS, ARCH) {
         ("linux", "x86_64") => ("Linux", "x86_64", "lightpanda-x86_64-linux"),
@@ -102,6 +107,32 @@ ws_url = "ws://127.0.0.1:9222/"
     println!("    lightpanda serve --host 127.0.0.1 --port 9222 --block-private-networks &");
     println!("    crw-server");
     println!();
+
+    if prewarm_camofox {
+        #[cfg(feature = "camofox")]
+        {
+            use crw_renderer::camofox_supervisor::{CamofoxSupervisor, DEFAULT_COLD_START};
+            println!("  → Pre-warming managed Camofox (first run downloads the Camoufox engine)…");
+            let sup = CamofoxSupervisor::new("http://127.0.0.1:9377", None);
+            match sup.ensure_ready(DEFAULT_COLD_START).await {
+                Ok(()) => {
+                    println!("  ✓ camofox-browser server answered /health; tearing it down");
+                    println!("    (`manage = true` lazy-wakes it on the first heavy request)");
+                    sup.stop().await;
+                }
+                Err(e) => {
+                    eprintln!("  ✗ managed camofox pre-warm failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            println!();
+        }
+        #[cfg(not(feature = "camofox"))]
+        {
+            eprintln!("  ✗ --camofox requires a binary built with the `camofox` feature");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn download_binary(url: &str) -> Result<Vec<u8>, reqwest::Error> {

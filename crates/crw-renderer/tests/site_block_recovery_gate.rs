@@ -77,6 +77,7 @@ fn site_block_suppression_tracks_whether_a_recovery_tier_exists() {
                 api_key: None,
                 challenge_wait_ms: 20_000,
                 clearance_reuse: true,
+                manage: false,
             }),
             ..lightpanda_only()
         };

@@ -102,6 +102,12 @@ pub async fn search_papers(
     Query(q): Query<PapersQuery>,
 ) -> Result<Json<PapersResponse>, AppError> {
     let client = backend(&state)?;
+    // The web leg drives Camofox directly (bypasses the render ladder), so
+    // this route owns waking a managed (`manage = true`) host-local server —
+    // and surfacing the failure rather than silently returning an empty web
+    // leg, which `camofox_papers` would do via its error-swallowing `let
+    // Ok(_) else`. No-op for external endpoints.
+    state.ensure_camofox_ready().await?;
     let k = clamp_k(q.k);
     let f = SearchFilters {
         authors: q.authors,

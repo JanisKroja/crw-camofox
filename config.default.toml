@@ -43,6 +43,17 @@ pool_size = 4
 # Strongly recommended for production: configure both. LightPanda alone
 # will return broken HTML for sites that crash during hydration.
 
+# NATIVE MODE master switch (single machine, no Docker; see
+# docs/docs/native-macos.md): when true, crw-server spawns the LightPanda
+# binary itself (PATH → ~/.crw/lightpanda → auto-download) and reaps it on
+# shutdown. The stock [renderer.lightpanda] ws_url counts as "unconfigured":
+# nothing listening on 9222 ⇒ it is managed and the URL is replaced with the
+# spawned instance's; a live server there — or any custom ws_url — is treated
+# as external and left alone. Camofox is managed per endpoint via
+# [renderer.camofox] manage below. Both switches are OFF by default:
+# container deployments bring their own sidecars and must keep these unset.
+# manage_browsers = true
+
 [renderer.lightpanda]
 ws_url = "ws://127.0.0.1:9222/"
 
@@ -67,6 +78,18 @@ ws_url = "ws://127.0.0.1:9222/"
 # api_key = "..."                 # only if the camofox server runs with auth
 # challenge_wait_ms = 20000       # wait for a Cloudflare "Just a moment" page to clear; 0 = off
 # clearance_reuse = true          # cache cf_clearance + UA per host, reuse on the HTTP tier
+# manage = true                   # NATIVE MODE (single machine, no Docker): crw owns the
+#                                 # endpoint lifecycle — lazy-wakes a host-local
+#                                 # `camofox-browser` (PATH, or `npx -y
+#                                 # camofox-browser@<pin>`; override with
+#                                 # CRW_CAMOFOX_BROWSER_BIN / _VERSION) on first
+#                                 # heavy/search request, adopts an already-live
+#                                 # server, respawns after a crash, group-kills the
+#                                 # tree (Node server + Firefox children) on
+#                                 # shutdown. Requires a loopback base_url and a
+#                                 # build with the `camofox` feature. Off = the
+#                                 # endpoint is external (container contract).
+#                                 # See docs/docs/native-macos.md.
 
 # Byparr (FlareSolverr-compatible challenge solver, e.g. ghcr.io/thephaseless/byparr).
 # Tried last, and only when an earlier attempt came back as an anti-bot challenge
