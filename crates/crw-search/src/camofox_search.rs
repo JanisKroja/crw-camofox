@@ -3,11 +3,14 @@
 //! Search SERPs trip anti-bot / consent walls immediately, so search does NOT
 //! use the renderer failover ladder — it drives the camofox-browser (Firefox)
 //! tier directly: navigate a tab to the engine's SERP, wait, then scrape the
-//! result rows via `/evaluate`. Google uses the browser's built-in
-//! `@google_search` macro; Bing/DuckDuckGo/GitHub have no working macro in
-//! camofox-browser, so we navigate their search URL directly (see
-//! [`navigate_body`]). Multiple engines requested in one call run sequentially
-//! on the warm tab and their rows are merged (see [`merge_results`]).
+//! result rows via `/evaluate`. Google navigates its SERP URL directly with
+//! the locale pinned (`hl=en&gl=us`, so the extractor sees stable English
+//! markup) and falls back to the browser's `@google_search` macro when the
+//! direct URL renders no rows (consent wall); Bing/DuckDuckGo have no working
+//! macro in camofox-browser, so they always navigate their search URL directly
+//! (see [`navigate_body`]). Multiple engines requested in one call run
+//! sequentially on the warm tab and their rows are merged (see
+//! [`merge_results`]).
 //!
 //! Concurrency: camofox-browser keys one persistent context per `userId` and
 //! eagerly tears that context down when its tab count hits zero, leaving a
@@ -69,7 +72,16 @@ const REDIRECT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// comes back as a string we can parse. Selectors are intentionally broad and
 /// kept in this one place — Google rewrites its SERP DOM periodically, so this
 /// is the single spot to fix when extraction drifts.
-const GOOGLE_SCRAPE_JS: &str = r#"JSON.stringify(Array.from(document.querySelectorAll('div.g, div.MjjYud')).map(function(el){var a=el.querySelector('a[href]');var h=el.querySelector('h3');var s=el.querySelector('.VwiC3b, [data-sncf], .st');return (a&&h)?{url:a.href,title:h.innerText,content:s?s.innerText:''}:null;}).filter(Boolean))"#;
+///
+/// Two chrome guards, both learned live: the title may ONLY come from an `h3`
+/// INSIDE the organic anchor (Google's AI-mode teaser heading sits loose in
+/// the same `div.g` container and previously paired onto the next row's URL),
+/// and chrome anchors pointing back at Google (`/search`, `/set/…` — the
+/// AI-mode / related-search links) are skipped, so an interstitial never
+/// contributes a row. A row whose anchor carries no inner `h3` keeps its
+/// anchor text (possibly empty — the API client can still title it from the
+/// URL).
+const GOOGLE_SCRAPE_JS: &str = r#"JSON.stringify(Array.from(document.querySelectorAll('div.g, div.MjjYud')).map(function(el){var CHROME=/^https?:\/\/(?:www\.)?google\.[a-z0-9.]+\/(search|set|async|gen_204)($|[\/?#])/i;var links=el.querySelectorAll('a[href]');var s=el.querySelector('.VwiC3b, [data-sncf], .st');var snip=s?s.innerText:'';for(var i=0;i<links.length;i++){var a=links[i];if(CHROME.test(a.href||''))continue;var h=a.querySelector('h3');if(h)return{url:a.href,title:h.innerText,content:snip};}for(var j=0;j<links.length;j++){if(!CHROME.test(links[j].href||''))return{url:links[j].href,title:(links[j].innerText||'').trim(),content:snip};}return null;}).filter(Boolean))"#;
 
 /// Bing SERP extractor. `li.b_algo` rows; `h2 a` for title/url, `.b_caption p`
 /// for the snippet. Bing wraps result links in a `bing.com/ck/a?…&u=a1<base64>`
@@ -119,17 +131,23 @@ fn scrape_js(engine: SearchEngine) -> &'static str {
 }
 
 /// The camofox `navigate` request body for a browser-driven engine + query.
-/// Google uses the browser's built-in `@google_search` macro (it handles the
-/// consent/redirect dance). Bing/DuckDuckGo have no working macro in
-/// camofox-browser, so we navigate their search URL directly — the macro is
-/// only URL shorthand anyway. `query` is form-url-encoded into the `q`
-/// parameter. GitHub is handled via the REST Search API and never reaches here.
+/// Google navigates its search URL directly with `hl=en&gl=us`: the SERP
+/// locale follows the exit IP otherwise (the request-level `lang` param is
+/// SearXNG-only), and a localized SERP hands the extractor foreign-language
+/// section headings. If the direct URL ever lands on a consent wall or other
+/// interstitial ([`run_search`]), Google retries via the battle-tested
+/// `@google_search` macro, which handles the consent/redirect dance itself.
+/// Bing/DuckDuckGo have no working macro in camofox-browser, so they always
+/// navigate their search URL directly — the macro is only URL shorthand.
+/// `query` is form-url-encoded into the `q` parameter. GitHub is handled via
+/// the REST Search API and never reaches here.
 fn navigate_body(engine: SearchEngine, query: &str) -> serde_json::Value {
     let q: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
     match engine {
-        SearchEngine::Google => {
-            json!({ "userId": USER_ID, "macro": "@google_search", "query": query })
-        }
+        SearchEngine::Google => json!({
+            "userId": USER_ID,
+            "url": format!("https://www.google.com/search?q={q}&hl=en&gl=us")
+        }),
         SearchEngine::Bing => {
             json!({ "userId": USER_ID, "url": format!("https://www.bing.com/search?q={q}") })
         }
@@ -154,6 +172,13 @@ fn navigate_body(engine: SearchEngine, query: &str) -> serde_json::Value {
             unreachable!("github uses the REST Search API, not the browser")
         }
     }
+}
+
+/// The camofox `@google_search` macro navigate body — Google's locale-agnostic
+/// fallback when the direct SERP URL yields no rows (consent wall, interstitial
+/// redirect). The macro handles the consent/redirect dance itself.
+fn google_macro_body(query: &str) -> serde_json::Value {
+    json!({ "userId": USER_ID, "macro": "@google_search", "query": query })
 }
 
 /// One scraped SERP row, as emitted by the per-engine extractors ([`scrape_js`]).
@@ -487,18 +512,18 @@ impl CamofoxSearchClient {
         }
     }
 
-    async fn run_search(
+    /// Navigate one tab with `body`, wait for the SERP, scrape the rows, and
+    /// return them raw (no redirect resolution — that is the caller's, so a
+    /// fallback attempt does not pay for it twice). Navigate/evaluate failures
+    /// propagate unchanged: they are the stale-tab signal the caller's tab-swap
+    /// retry keys on, and must not be swallowed by an engine-level fallback.
+    async fn scrape_rows(
         &self,
         tab_id: &str,
         engine: SearchEngine,
-        params: &SearxngParams,
-    ) -> Result<Vec<SearxngResult>, SearchError> {
-        let nav = self
-            .post(
-                &format!("/tabs/{tab_id}/navigate"),
-                navigate_body(engine, &params.q),
-            )
-            .await?;
+        body: serde_json::Value,
+    ) -> Result<Vec<ScrapedRow>, SearchError> {
+        let nav = self.post(&format!("/tabs/{tab_id}/navigate"), body).await?;
         if !nav.status().is_success() {
             return Err(upstream_error("navigate", nav).await);
         }
@@ -540,11 +565,43 @@ impl CamofoxSearchClient {
             serde_json::from_str(&raw)
                 .map_err(|e| SearchError::InvalidResponse(format!("camofox: scrape JSON: {e}")))?
         };
+        Ok(rows)
+    }
+
+    async fn run_search(
+        &self,
+        tab_id: &str,
+        engine: SearchEngine,
+        params: &SearxngParams,
+    ) -> Result<Vec<SearxngResult>, SearchError> {
+        let mut rows = self
+            .scrape_rows(tab_id, engine, navigate_body(engine, &params.q))
+            .await?;
+        // The pinned-English direct URL can land on a consent wall or another
+        // interstitial on a fresh browser profile (a successful navigate that
+        // renders no organic rows). Fall back to the macro, which walks the
+        // consent dance itself. A failed navigate/evaluate is NOT retried here:
+        // that is the stale-tab path, handled by the caller's tab swap.
+        if rows.is_empty() && matches!(engine, SearchEngine::Google) {
+            tracing::debug!(
+                "camofox: empty Google SERP via direct URL; retrying via @google_search macro"
+            );
+            rows = self
+                .scrape_rows(tab_id, engine, google_macro_body(&params.q))
+                .await?;
+        }
+
+        // Drop SERP-chrome rows that survived the extractor: an anchor still
+        // pointing back at Google's own `/search` / `/set/…` is an AI-mode or
+        // related-search chip, never an organic result. Organic links always
+        // carry an off-origin URL or one of the wrapper paths.
+        if matches!(engine, SearchEngine::Google) {
+            rows.retain(|r| !is_google_chrome_link(&r.url));
+        }
 
         // Google now links every result through `/goto?url=<opaque token>`, and
         // the real URL is nowhere else in the result markup. Resolve them all at
         // once; a link that cannot be resolved keeps its redirect URL.
-        let mut rows = rows;
         if matches!(engine, SearchEngine::Google) {
             let resolved = futures::future::join_all(rows.iter().map(|r| async {
                 if self.is_result_redirect(&r.url) {
@@ -705,6 +762,24 @@ fn is_google_redirect(url: &str) -> bool {
         && matches!(u.path(), "/goto" | "/url")
 }
 
+/// True for a scraped Google row that is SERP chrome rather than an organic
+/// result: an https link on Google itself pointing at its own UI
+/// (`/search` — the AI-mode teaser and related-search chips; `/set/…`,
+/// `/async`, `/gen_204`). Organic rows always carry an off-origin URL or one
+/// of the wrapper paths [`is_google_redirect`] recognizes, so those stay.
+fn is_google_chrome_link(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    if u.scheme() != "https" || !matches!(u.host_str(), Some("www.google.com") | Some("google.com"))
+    {
+        return false;
+    }
+    let path = u.path();
+    !is_google_redirect(url)
+        && (path.starts_with("/search") || path.starts_with("/set/") || path.starts_with("/async"))
+}
+
 /// Merge per-engine result rows into one response, deduped by URL. A URL seen
 /// by multiple engines accumulates their `engines`/`positions` and sums their
 /// position-scores, so cross-engine agreement ranks higher. First-appearance
@@ -828,10 +903,20 @@ mod extractor_tests {
     }
 
     #[test]
-    fn google_navigates_by_macro_others_by_url() {
+    fn all_browser_engines_navigate_by_url_google_pinned_english() {
+        // Google navigates directly with the locale pinned (hl/gl), so the
+        // extractor sees stable English UI markup regardless of exit IP.
         let g = navigate_body(SearchEngine::Google, "rust lang");
-        assert_eq!(g["macro"], "@google_search");
-        assert_eq!(g["query"], "rust lang");
+        assert_eq!(
+            g["url"],
+            "https://www.google.com/search?q=rust+lang&hl=en&gl=us"
+        );
+        assert!(g.get("macro").is_none());
+
+        // The macro remains the consent-wall fallback body.
+        let gm = google_macro_body("rust lang");
+        assert_eq!(gm["macro"], "@google_search");
+        assert_eq!(gm["query"], "rust lang");
 
         // Non-macro browser engines navigate a search URL, query url-encoded.
         let b = navigate_body(SearchEngine::Bing, "rust lang");
@@ -921,6 +1006,30 @@ mod google_redirect_tests {
         assert!(!is_google_redirect(
             "https://www.google.evil.example/goto?url=x"
         ));
+    }
+
+    #[test]
+    fn google_chrome_links_are_recognised() {
+        // The AI-mode teaser heading links a NEW query on Google itself.
+        assert!(is_google_chrome_link(
+            "https://www.google.com/search?q=deepseek+harness&ai=APn0"
+        ));
+        assert!(is_google_chrome_link("https://www.google.com/set/ai_mode"));
+        assert!(is_google_chrome_link(
+            "https://www.google.com/async/ctx?x=1"
+        ));
+        // Organic wrapper links are NOT chrome (they hide the real target).
+        assert!(!is_google_chrome_link(
+            "https://www.google.com/url?q=https://x.dev/"
+        ));
+        assert!(!is_google_chrome_link(
+            "https://www.google.com/goto?url=CAESVwHrOzAV"
+        ));
+        assert!(!is_google_chrome_link("https://deepseek.com/harness"));
+        assert!(!is_google_chrome_link(
+            "https://www.google.evil.example/search?q=x"
+        ));
+        assert!(!is_google_chrome_link("not a url"));
     }
 
     /// Google's `/goto?url=<opaque token>` answers a plain 302 whose `Location`
