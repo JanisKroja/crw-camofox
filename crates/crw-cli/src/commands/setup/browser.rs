@@ -73,6 +73,11 @@ pub struct PlatformInfo {
 }
 
 /// Get platform info for LightPanda download.
+///
+/// Mirrors the renderer's `lightpanda_asset_name` table (and `crw-server`'s
+/// `setup`): upstream publishes exactly these four nightlies, and the
+/// `setup_tables_agree_with_the_renderer_matrix` test in `crw-renderer` fails
+/// if a future edit drops one of the names here.
 pub fn get_platform_info() -> Option<PlatformInfo> {
     match (OS, ARCH) {
         ("linux", "x86_64") => Some(PlatformInfo {
@@ -80,10 +85,20 @@ pub fn get_platform_info() -> Option<PlatformInfo> {
             arch_label: "x86_64",
             binary_name: "lightpanda-x86_64-linux",
         }),
+        ("linux", "aarch64") => Some(PlatformInfo {
+            os_label: "Linux",
+            arch_label: "aarch64",
+            binary_name: "lightpanda-aarch64-linux",
+        }),
         ("macos", "aarch64") => Some(PlatformInfo {
             os_label: "macOS",
             arch_label: "aarch64 (Apple Silicon)",
             binary_name: "lightpanda-aarch64-macos",
+        }),
+        ("macos", "x86_64") => Some(PlatformInfo {
+            os_label: "macOS",
+            arch_label: "x86_64 (Intel)",
+            binary_name: "lightpanda-x86_64-macos",
         }),
         _ => None,
     }
@@ -145,7 +160,8 @@ pub fn detect_lightpanda() -> Option<PathBuf> {
 pub async fn download_lightpanda() -> Result<PathBuf, String> {
     let platform = get_platform_info().ok_or_else(|| {
         format!(
-            "Unsupported platform: {} {}. LightPanda provides binaries for Linux x86_64 and macOS aarch64.",
+            "Unsupported platform: {} {}. LightPanda provides nightlies for \
+             Linux x86_64/aarch64 and macOS x86_64/aarch64.",
             OS, ARCH
         )
     })?;
@@ -306,11 +322,36 @@ mod tests {
 
     #[test]
     fn test_get_platform_info() {
-        // This test is platform-dependent
+        // The four assets upstream publishes under the `nightly` tag.
+        const PUBLISHED: [&str; 4] = [
+            "lightpanda-x86_64-linux",
+            "lightpanda-aarch64-linux",
+            "lightpanda-aarch64-macos",
+            "lightpanda-x86_64-macos",
+        ];
+
         let info = get_platform_info();
-        // On supported platforms, should return Some
-        // On unsupported platforms, returns None
-        let _ = info;
+        let (os, arch) = (OS, ARCH);
+
+        if let Some(info) = &info {
+            assert!(
+                PUBLISHED.contains(&info.binary_name),
+                "unknown LightPanda asset name: {}",
+                info.binary_name
+            );
+        }
+
+        // A missing arm used to be invisible here: the test returned Some or
+        // None by luck on whatever host CI ran on, while `macOS x86_64` and
+        // `Linux aarch64` had both silently dropped out of `setup` despite
+        // upstream shipping those binaries. On a host upstream covers, the arm
+        // must exist.
+        if ["linux", "macos"].contains(&os) && ["x86_64", "aarch64"].contains(&arch) {
+            assert!(
+                info.is_some(),
+                "{os}/{arch} is in LightPanda's nightly matrix but has no arm here"
+            );
+        }
     }
 
     #[test]

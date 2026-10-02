@@ -284,15 +284,32 @@ fn lightpanda_managed_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".crw").join("lightpanda"))
 }
 
+/// The nightly-release asset name for a platform, `None` where LightPanda
+/// publishes no binary for it.
+///
+/// Upstream ships exactly four assets under the `nightly` tag — Linux and
+/// macOS, each `x86_64` and `aarch64` — so this is the whole support surface,
+/// not a preference. The two `setup` tables (`crw-server/src/setup.rs` and
+/// `crw-cli/src/commands/setup/browser.rs`) mirror it; the test at the bottom
+/// of this file pins all four names so a table that drifts goes red.
+fn lightpanda_asset_name(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("lightpanda-aarch64-macos"),
+        ("macos", "x86_64") => Some("lightpanda-x86_64-macos"),
+        ("linux", "x86_64") => Some("lightpanda-x86_64-linux"),
+        ("linux", "aarch64") => Some("lightpanda-aarch64-linux"),
+        _ => None,
+    }
+}
+
 /// Get the correct download URL for the current platform.
 fn lightpanda_download_url() -> Option<String> {
     let base = "https://github.com/lightpanda-io/browser/releases/download/nightly";
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
 
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some(format!("{base}/lightpanda-aarch64-macos")),
-        ("linux", "x86_64") => Some(format!("{base}/lightpanda-x86_64-linux")),
-        ("linux", "aarch64") => Some(format!("{base}/lightpanda-aarch64-linux")),
-        (os, arch) => {
+    match lightpanda_asset_name(os, arch) {
+        Some(asset) => Some(format!("{base}/{asset}")),
+        None => {
             tracing::debug!("No LightPanda binary available for {os}/{arch}");
             None
         }
@@ -635,5 +652,72 @@ pub async fn lightpanda_should_be_managed(ws_url: Option<&str>) -> bool {
             !matches!(probe, Ok(Ok(_)))
         }
         Some(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table must be exactly upstream's `nightly` asset set: inventing an
+    /// entry yields a 404 at the moment a user first tries to render, and
+    /// missing one silently removes the light tier (the Intel-macOS case that
+    /// motivated this test — `setup --camofox` refused to run and the ladder
+    /// dropped LightPanda behind a single `debug!`).
+    #[test]
+    fn lightpanda_asset_name_mirrors_upstream_matrix() {
+        for (os, arch, asset) in [
+            ("macos", "aarch64", "lightpanda-aarch64-macos"),
+            ("macos", "x86_64", "lightpanda-x86_64-macos"),
+            ("linux", "x86_64", "lightpanda-x86_64-linux"),
+            ("linux", "aarch64", "lightpanda-aarch64-linux"),
+        ] {
+            assert_eq!(
+                lightpanda_asset_name(os, arch),
+                Some(asset),
+                "{os}/{arch} must map to upstream's {asset}"
+            );
+        }
+        for (os, arch) in [
+            ("windows", "x86_64"),
+            ("macos", "arm"),
+            ("linux", "riscv64"),
+        ] {
+            assert_eq!(
+                lightpanda_asset_name(os, arch),
+                None,
+                "{os}/{arch} has no upstream LightPanda build"
+            );
+        }
+    }
+
+    /// `crw-server setup` and `crw-cli setup` each carry their own copy of this
+    /// table (label + asset name), in crates that must not depend on this one.
+    /// Nothing else ties the three together, and they had already drifted: both
+    /// setup tables had dropped `linux/aarch64` while the renderer shipped it.
+    /// So every asset name above must appear verbatim in both sibling sources.
+    #[test]
+    fn setup_tables_agree_with_the_renderer_matrix() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_dir = crate_dir
+            .parent()
+            .expect("crw-renderer must sit directly under crates/");
+        let siblings = [
+            crates_dir.join("crw-server/src/setup.rs"),
+            crates_dir.join("crw-cli/src/commands/setup/browser.rs"),
+        ];
+
+        for path in siblings {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            for asset in [
+                "lightpanda-aarch64-macos",
+                "lightpanda-x86_64-macos",
+                "lightpanda-x86_64-linux",
+                "lightpanda-aarch64-linux",
+            ] {
+                assert!(src.contains(asset), "{} is missing {asset}", path.display());
+            }
+        }
     }
 }

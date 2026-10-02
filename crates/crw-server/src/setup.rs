@@ -15,12 +15,25 @@ const LIGHTPANDA_BASE_URL: &str =
 /// budget on the engine download.
 pub async fn run_setup(prewarm_camofox: bool) {
     println!();
+    // Mirrors the renderer's `lightpanda_asset_name` table (and crw-cli's
+    // `get_platform_info`): upstream publishes exactly these four nightlies.
+    // `crw_renderer`'s test `setup_tables_agree_with_the_renderer_matrix` fails
+    // if a future edit drops one of the names here.
     let (os_label, arch_label, binary_name) = match (OS, ARCH) {
         ("linux", "x86_64") => ("Linux", "x86_64", "lightpanda-x86_64-linux"),
-        ("macos", "aarch64") => ("macOS", "aarch64", "lightpanda-aarch64-macos"),
+        ("linux", "aarch64") => ("Linux", "aarch64", "lightpanda-aarch64-linux"),
+        ("macos", "aarch64") => (
+            "macOS",
+            "aarch64 (Apple Silicon)",
+            "lightpanda-aarch64-macos",
+        ),
+        ("macos", "x86_64") => ("macOS", "x86_64 (Intel)", "lightpanda-x86_64-macos"),
         _ => {
             eprintln!("  ✗ Unsupported platform: {OS} {ARCH}");
-            eprintln!("    LightPanda provides binaries for Linux x86_64 and macOS aarch64.");
+            eprintln!(
+                "    LightPanda provides nightlies for Linux x86_64/aarch64 and \
+                 macOS x86_64/aarch64."
+            );
             std::process::exit(1);
         }
     };
