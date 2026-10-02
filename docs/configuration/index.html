@@ -325,6 +325,18 @@ ws_url = &quot;ws://127.0.0.1:9222/&quot;
 # [renderer.chrome_proxy]
 # ws_url = &quot;ws://chrome-proxy:9222&quot;
 
+# Chrome-impersonation HTTP tier (wreq). No endpoint: the tier is in-process.
+# Requires a build with `--features impersonated` (the published Docker image
+# ships it ON). Sits between the plain HTTP tier and the browser ladder in auto
+# mode, fires only when the plain tier hit an anti-bot wall (e.g. the Amazon.it
+# interstitial) or a fingerprint-shaped transport error, and is pinnable per
+# request with renderer = &quot;impersonated-http&quot;. When a browser ladder is
+# configured the hop is capped at half the remaining request deadline so it can
+# never starve it. ON by default; disable with enabled = false.
+# [renderer.impersonated]
+# enabled = true               # runtime kill switch (default true)
+# timeout_ms = 15000           # per-request budget for the tier (default 15 s)
+
 # Camofox (camofox-browser REST) — the Firefox/Camoufox anti-detect tier. Not a
 # CDP endpoint: base_url is the camofox-browser HTTP server. In `auto` mode it
 # takes Chrome&#39;s ladder slot (after LightPanda). When set, it also backs
@@ -332,6 +344,35 @@ ws_url = &quot;ws://127.0.0.1:9222/&quot;
 # [renderer.camofox]
 # base_url = &quot;http://127.0.0.1:9377&quot;
 # api_key = &quot;...&quot;                 # only if the camofox server runs with auth
+# challenge_wait_ms = 20000       # wait for a Cloudflare &quot;Just a moment&quot; page to clear; 0 = off
+# clearance_reuse = true          # cache cf_clearance + UA per host, reuse on the HTTP tier
+# reap_orphan_tabs = true         # close the tab a `POST /tabs` registered server-side but never
+#                                 # named to us (answer lost to a timeout, a disconnect, or the
+#                                 # request being cancelled mid-create). Such a tab otherwise
+#                                 # holds 1 of the session&#39;s 10 tab slots for the full 30 min
+#                                 # session timeout — camofox&#39;s idle reaper only collects
+#                                 # ZERO-tab sessions — and 10 of them make every create fail 429.
+#                                 # Only acts when it can list tabs, finds exactly one it never
+#                                 # registered, that tab reports crw&#39;s own sessionKey, and it is
+#                                 # still about:blank. Needs `manage = true`: the &quot;what I
+#                                 # registered&quot; ledger is per-process while camofox keys tabs by
+#                                 # userId, so against a shared external endpoint a second crw
+#                                 # process would look like an orphan. `manage = true` is the
+#                                 # proxy for ownership, not its proof — an already-running
+#                                 # camofox is adopted rather than started, so two crw servers
+#                                 # on one endpoint both believe it is theirs. Run ONE crw per
+#                                 # userId+sessionKey per camofox.
+#                                 # Reaps count crw_camofox_tab_leak_total{cause=&quot;create-orphan&quot;}.
+
+# Byparr (FlareSolverr-compatible challenge solver, e.g. ghcr.io/thephaseless/byparr).
+# Tried last, and only when an earlier attempt came back as an anti-bot challenge
+# or wall; each solve launches a browser. Byparr has no auth: keep it off public
+# interfaces.
+# [renderer.byparr]
+# base_url = &quot;http://127.0.0.1:8191&quot;
+# timeout_ms = 30000              # longest one solve may take, inside the request deadline
+# max_concurrent = 2              # concurrent solves
+# clearance_reuse = true          # cache cf_clearance + UA per host, reuse on the HTTP tier
 
 [search]
 enabled = true
@@ -450,6 +491,34 @@ stealth = true
 <td><code>CRW_RENDERER__CAMOFOX__API_KEY</code></td>
 </tr>
 <tr>
+<td><code>renderer.camofox.challenge_wait_ms</code></td>
+<td><code>CRW_RENDERER__CAMOFOX__CHALLENGE_WAIT_MS</code></td>
+</tr>
+<tr>
+<td><code>renderer.camofox.clearance_reuse</code></td>
+<td><code>CRW_RENDERER__CAMOFOX__CLEARANCE_REUSE</code></td>
+</tr>
+<tr>
+<td><code>renderer.camofox.reap_orphan_tabs</code></td>
+<td><code>CRW_RENDERER__CAMOFOX__REAP_ORPHAN_TABS</code></td>
+</tr>
+<tr>
+<td><code>renderer.byparr.base_url</code></td>
+<td><code>CRW_RENDERER__BYPARR__BASE_URL</code></td>
+</tr>
+<tr>
+<td><code>renderer.byparr.timeout_ms</code></td>
+<td><code>CRW_RENDERER__BYPARR__TIMEOUT_MS</code></td>
+</tr>
+<tr>
+<td><code>renderer.byparr.max_concurrent</code></td>
+<td><code>CRW_RENDERER__BYPARR__MAX_CONCURRENT</code></td>
+</tr>
+<tr>
+<td><code>renderer.byparr.clearance_reuse</code></td>
+<td><code>CRW_RENDERER__BYPARR__CLEARANCE_REUSE</code></td>
+</tr>
+<tr>
 <td><code>search.searxng_url</code></td>
 <td><code>CRW_SEARCH__SEARXNG_URL</code></td>
 </tr>
@@ -524,6 +593,9 @@ stealth = true
 </tr>
 </tbody></table>
 <p>The server <code>mode</code> controls <strong>availability</strong> of renderers in the pool. Per-request <code>renderer</code> selects from what&#39;s available — see <a href="/js-rendering">JS rendering</a>. A request that pins an unavailable renderer returns HTTP 400 with the configured pool listed.</p>
+<h3 id="impersonated-http-tier">Impersonated HTTP tier</h3>
+<p><code>[renderer.impersonated]</code> enables a Chrome-fingerprint HTTP tier that runs between the plain fetch and the browser ladder. It executes no JavaScript: it clears walls that gate on the TLS fingerprint (the Amazon interstitial class) in HTTP time, and hands everything else to the ladder unchanged. Pin it per request with <code>renderer: &quot;impersonated-http&quot;</code>; combining that pin with <code>renderJs: true</code> is rejected.</p>
+<p>Known gap: a request that sets a per-request <code>proxy</code> or a per-request <code>stealth</code> override uses a temporary plain HTTP fetcher and never hops. The pin is honoured but ignores the per-request proxy.</p>
 <h2 id="docker-configuration">Docker configuration</h2>
 <p>For Docker deployments, use <code>config.docker.toml</code> or environment variables:</p>
 <pre><code class="language-bash">docker run -p 3000:3000 \

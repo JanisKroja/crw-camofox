@@ -334,19 +334,19 @@ docker run -p 3000:3000 ghcr.io/adambenhassen/crw-camofox:latest
 # With docker-compose (includes LightPanda sidecar)
 docker compose up
 </code></pre>
-<p>The Docker image uses a multi-stage build: <code>rust:1.93-bookworm</code> for building, <code>debian:bookworm-slim</code> for runtime. The compose file includes a LightPanda sidecar for JS rendering.</p>
+<p>The Docker image uses a multi-stage build: <code>rust:1.98-bookworm</code> for building, <code>debian:bookworm-slim</code> for runtime. Build your own binaries with a matching toolchain — the <code>impersonated</code> tier pulls <code>wreq</code>, whose current release requires rustc ≥ 1.98, so an older cargo refuses to resolve it. The compose file includes a LightPanda sidecar for JS rendering.</p>
 <h2 id="js-rendering-setup">JS Rendering Setup</h2>
 <p>crw supports JavaScript rendering via CDP (Chrome DevTools Protocol). The fastest option is LightPanda:</p>
 <pre><code class="language-bash"># Automatic setup (downloads LightPanda + creates config.local.toml)
 crw-server setup
 
 # Start LightPanda
-lightpanda serve --host 127.0.0.1 --port 9222 &amp;
+lightpanda serve --host 127.0.0.1 --port 9222 --block-private-networks &amp;
 
 # Start crw
 crw-server
 </code></pre>
-<p>The <code>setup</code> command detects your platform (Linux x86_64, macOS aarch64) and downloads the appropriate LightPanda binary to <code>~/.local/bin/lightpanda</code>.</p>
+<p>The <code>setup</code> command detects your platform (Linux x86_64/aarch64, macOS x86_64/aarch64 — the four LightPanda nightlies) and downloads the appropriate binary to <code>~/.local/bin/lightpanda</code>. On a single machine you can skip this section entirely and let crw own the browsers instead: that is <em>native mode</em>, documented in <code>docs/docs/native-macos.md</code>.</p>
 <h3 id="other-cdp-backends">Other CDP backends</h3>
 <p>You can also use Playwright or Chrome. Set the WebSocket URL in your config:</p>
 <pre><code class="language-toml">[renderer]

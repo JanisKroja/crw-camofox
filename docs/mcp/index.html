@@ -737,9 +737,16 @@ codex mcp add crw -- npx crw-mcp
 <td><code>scrapeOptions</code></td>
 <td>object</td>
 <td>no</td>
-<td>Scrape each result page (e.g. <code>{&quot;formats&quot;: [&quot;markdown&quot;]}</code>)</td>
+<td>Scrape each result page and inline requested formats (e.g. <code>{&quot;formats&quot;: [&quot;markdown&quot;]}</code>)</td>
+</tr>
+<tr>
+<td><code>maxLength</code></td>
+<td>integer</td>
+<td>no</td>
+<td>Max total characters across all inlined scrape content (default: 15,000; <code>0</code> disables limit)</td>
 </tr>
 </tbody></table>
+<p>For lower context use, search without <code>scrapeOptions</code>, then call <code>crw_scrape</code> only for selected URLs. When inline scraping is useful, reduce <code>limit</code> or <code>maxLength</code>; search metadata such as title, URL, description, and snippet does not consume this content budget.</p>
 <h2 id="example-agent-tool-flow">Example Agent Tool Flow</h2>
 <p>A clean MCP setup often assigns each CRW route a narrow purpose:</p>
 <ul>

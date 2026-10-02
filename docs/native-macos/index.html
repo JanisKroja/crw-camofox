@@ -3,25 +3,25 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Docker — CRW Docs</title>
-  <meta name="description" content="Run crw with Docker Compose for the easiest setup with JS rendering included.">
+  <title>Native Mode (no Docker) — CRW Docs</title>
+  <meta name="description" content="The Docker Compose stack is the production contract: sidecar isolation">
   <meta name="keywords" content="web scraper, web crawler, firecrawl alternative, crawl4ai alternative, self-hosted scraper, rust web scraper, mcp server, ai web scraping, rag pipeline, llm extraction, open source crawler, headless browser scraper">
-  <link rel="canonical" href="https://docs.fastcrw.com/docker">
+  <link rel="canonical" href="https://docs.fastcrw.com/native-macos">
   <link rel="icon" href="/favicon.png?v=2" type="image/png">
   <link rel="alternate" type="application/json" href="/openapi.json" title="OpenAPI 3.1 spec">
   <link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt index">
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://docs.fastcrw.com/docker">
-  <meta property="og:title" content="Docker — CRW | Web Scraper in Rust">
-  <meta property="og:description" content="Run crw with Docker Compose for the easiest setup with JS rendering included.">
+  <meta property="og:url" content="https://docs.fastcrw.com/native-macos">
+  <meta property="og:title" content="Native Mode (no Docker) — CRW | Web Scraper in Rust">
+  <meta property="og:description" content="The Docker Compose stack is the production contract: sidecar isolation">
   <meta property="og:site_name" content="CRW">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Docker — CRW Docs">
-  <meta name="twitter:description" content="Run crw with Docker Compose for the easiest setup with JS rendering included.">
+  <meta name="twitter:title" content="Native Mode (no Docker) — CRW Docs">
+  <meta name="twitter:description" content="The Docker Compose stack is the production contract: sidecar isolation">
 
   <!-- Structured Data (JSON-LD) -->
   <script type="application/ld+json">
@@ -282,177 +282,224 @@ crw search "renewable energy trends 2024" --json --fields title,url,snippet --li
     </aside>
 
     <main class="content" id="content">
-      <article id="article" role="main"><h1 id="docker">Docker</h1>
-<p>Run crw with Docker Compose for the easiest setup with JS rendering included.</p>
-<h2 id="pre-built-image">Pre-built Image</h2>
-<pre><code class="language-bash">docker pull ghcr.io/adambenhassen/crw-camofox:latest
-docker run -p 3000:3000 ghcr.io/adambenhassen/crw-camofox:latest
-</code></pre>
-<p>Available tags: <code>latest</code>, <code>0.0.1</code>, <code>0.0</code></p>
-<h2 id="docker-compose">Docker Compose</h2>
-<pre><code class="language-bash">git clone https://github.com/us/crw.git
-cd crw
-docker compose up
-</code></pre>
-<blockquote>
-<p><strong>Build memory.</strong> The <code>crw</code> image builds from source with a release LTO link
-(<code>-C lto -C codegen-units=1</code> in the release profile), which is memory-hungry.
-Give Docker <strong>≥ 8 GB RAM</strong> for the build — on a 4 GB Docker VM the final
-<code>crw-server</code> link gets OOM-killed (<code>failed to solve: ResourceExhausted: cannot allocate memory</code>). If you&#39;re capped at 4 GB, serialize the build so only one
-codegen unit links at a time: <code>CARGO_BUILD_JOBS=1 docker compose build crw</code>,
-then <code>docker compose up -d</code>. This is a one-time build cost — the runtime image
-is small.</p>
-</blockquote>
-<p>The bundled <code>docker-compose.yml</code> starts these services:</p>
+      <article id="article" role="main"><h1 id="native-mode-no-docker">Native mode (no Docker)</h1>
+<p>The Docker Compose stack is the production contract: sidecar isolation
+(<code>read_only</code>, <code>cap_drop ALL</code>, pinned images), and it runs unchanged on any
+Linux server. On a single machine — a developer laptop, a work Mac — the VM
+that Compose requires is pure overhead: it reserves several GB of RAM, and on
+Apple Silicon the published <code>camofox-browser</code> image is <code>linux/amd64</code> only, so
+the stealth/search tier runs a fully <strong>emulated x86 Firefox</strong> inside it
+(~1.1 GB measured, vs ~460 MB for the same work natively).</p>
+<p>Native mode deletes the VM from the picture:</p>
 <table>
 <thead>
 <tr>
-<th>Service</th>
-<th>Port</th>
-<th>Default?</th>
-<th>Description</th>
+<th>Component</th>
+<th>Native form</th>
+<th>Obtained by</th>
 </tr>
 </thead>
 <tbody><tr>
-<td><strong>crw</strong></td>
-<td>3000¹</td>
-<td>✅</td>
-<td>API server (loads <code>config.docker.toml</code>)</td>
+<td><code>crw-server</code></td>
+<td>native Rust binary (<code>x86_64</code> and <code>aarch64</code>)</td>
+<td><code>cargo build --release -p crw-server --features cdp,camofox,impersonated</code></td>
 </tr>
 <tr>
-<td><strong>lightpanda</strong></td>
-<td>9222</td>
-<td>✅</td>
-<td>Lightweight headless browser for JS rendering</td>
+<td>LightPanda (light JS tier)</td>
+<td><code>lightpanda-&lt;arch&gt;-&lt;os&gt;</code> nightly</td>
+<td>auto-downloaded to <code>~/.crw/lightpanda</code> (or PATH)</td>
 </tr>
 <tr>
-<td><strong>camofox</strong></td>
-<td>9377</td>
-<td>✅</td>
-<td><a href="https://github.com/redf0x1/camofox-browser">Camofox</a> (Camoufox/Firefox) — heavy/stealth JS tier + <code>/v1/search</code> backend</td>
+<td>Camofox (heavy/stealth tier + <code>/v1/search</code>)</td>
+<td><code>npx camofox-browser@&lt;pin&gt;</code> + the pinned Camoufox engine for your platform</td>
+<td>spawned on demand by crw; <code>camoufox-js</code> fetches the engine into <code>~/Library/Caches/camoufox</code> (macOS) or <code>~/.cache/camoufox</code> (Linux)</td>
 </tr>
 <tr>
-<td><strong>byparr</strong></td>
-<td>8191</td>
-<td>✅</td>
-<td><a href="https://github.com/ThePhaseless/Byparr">Byparr</a> — Cloudflare challenge solver, called only after a challenge; no auth, never published</td>
-</tr>
-<tr>
-<td><strong>searxng</strong></td>
-<td>8080</td>
-<td><code>--profile searxng</code></td>
-<td>SearXNG meta-search backend for <code>/v1/search</code> (opt-in alternative to Camofox)</td>
+<td>Byparr (Cloudflare solver)</td>
+<td><em>no native build exists</em></td>
+<td>optional; keep remote — see below</td>
 </tr>
 </tbody></table>
-<p>¹ The host bind address and port are overridable without editing the Compose file: set <code>CRW_HOST_PORT</code> in <code>.env</code> (e.g. <code>CRW_HOST_PORT=3055</code>) if something else already holds 3000 on the box, and <code>CRW_BIND_ADDRESS</code> (e.g. <code>CRW_BIND_ADDRESS=127.0.0.1</code>) to stop publishing on public interfaces, for example when a reverse proxy fronts crw. Both default to <code>0.0.0.0:3000</code> and the container port stays <code>3000</code>. Compose interpolates these on the host into the port mapping only; unlike the <code>CRW_*</code> config keys elsewhere they are not delivered into the container, so the engine never reads them.</p>
-<p>The <code>crw</code> service reads its configuration from the mounted <code>config.docker.toml</code> (via
-<code>CRW_CONFIG=config.docker</code>), which already points each renderer at the matching
-service name on Compose&#39;s default bridge network (<code>lightpanda:9222</code>, <code>camofox:9377</code>,
-<code>byparr:8191</code>). You
-don&#39;t need to wire renderer URLs through environment variables — they&#39;re in the config file.</p>
-<p>The renderer ladder is <code>HTTP → LightPanda → Camofox → Byparr</code>. Byparr runs only when an earlier
-attempt came back as an anti-bot challenge or wall. The <code>cf_clearance</code> cookie it earns is cached per
-host, so the next scrape of that host goes out over plain HTTP.</p>
-<h2 id="search">Search</h2>
-<p><code>/v1/search</code> (and the <code>crw_search</code> MCP tool) is backed by the bundled <strong>camofox</strong> service by default —
-it drives Google through the Camoufox (Firefox) anti-detect browser, reachable inside the Compose network
-as <code>camofox:9377</code>. This is configured in <code>config.docker.toml</code>:</p>
-<pre><code class="language-toml">[renderer.camofox]
-base_url = &quot;http://camofox:9377&quot;
+<p>Idle footprint becomes <code>crw-server</code> (~50 MB) + LightPanda (~64 MB); Camofox
+starts <strong>only when a request first needs it</strong> and its own idle policy closes
+the browser between bursts.</p>
+<h2 id="host-coverage">Host coverage</h2>
+<p>Everything measured below comes from an Apple-Silicon laptop, because that is
+where native mode pays most. Nothing in the code is arm64-only:</p>
+<table>
+<thead>
+<tr>
+<th>Host</th>
+<th><code>crw-server</code></th>
+<th>LightPanda tier</th>
+<th>Camofox engine</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>macOS aarch64 (Apple Silicon)</td>
+<td>✅</td>
+<td>✅ <code>lightpanda-aarch64-macos</code></td>
+<td>✅ <code>mac.arm64</code></td>
+</tr>
+<tr>
+<td>macOS x86_64 (Intel)</td>
+<td>✅</td>
+<td>✅ <code>lightpanda-x86_64-macos</code></td>
+<td>✅ <code>mac.x86_64</code></td>
+</tr>
+<tr>
+<td>Linux x86_64</td>
+<td>✅</td>
+<td>✅ <code>lightpanda-x86_64-linux</code></td>
+<td>✅ <code>lin.x86_64</code></td>
+</tr>
+<tr>
+<td>Linux aarch64</td>
+<td>✅</td>
+<td>✅ <code>lightpanda-aarch64-linux</code></td>
+<td>✅ <code>lin.arm64</code></td>
+</tr>
+<tr>
+<td>Windows</td>
+<td>CI never builds it (untested)</td>
+<td>❌ no upstream binary</td>
+<td>✅ <code>win.x86_64</code></td>
+</tr>
+</tbody></table>
+<p>The <code>crw-server</code> column is what <code>cargo build</code> yields — the workspace has no
+arch-gated code — but CI only exercises Linux x86_64, so the other rows are
+inference rather than measurement. The two browser columns are upstream&#39;s own
+published artefact names, verified against the LightPanda <code>nightly</code> release and
+the Camoufox release manifest.</p>
+<ul>
+<li>The Rust side is arch-neutral: no <code>target_arch</code> gating anywhere, and CI
+builds and tests the shipping feature set (<code>cdp,camofox,impersonated</code>) on
+x86_64 Linux.</li>
+<li>The LightPanda table in <code>crw-renderer</code>/<code>crw-server</code>/<code>crw-cli</code> mirrors
+upstream&#39;s exactly four nightlies; a unit test pins the names so a missing
+arm goes red instead of silently dropping the light tier.</li>
+<li>The Camoufox engine is fetched by <code>camoufox-js</code>, which resolves the platform
+itself — crw never picks an arch, so a fresh host simply downloads its own.</li>
+<li><strong>x86_64 hosts win less.</strong> The published <code>camofox-browser</code> image is amd64, so
+in Docker that Firefox is already native: going native there drops the VM
+and its reserved RAM and buys lazy wake, but not the ~600 MB of emulation.</li>
+<li><strong>Windows is out of scope for these notes.</strong> Nothing gates it in the source
+(<code>cfg(unix)</code> covers the POSIX process-group reaping, with a <code>start_kill</code>
+fallback), but this fork&#39;s CI is Linux-only, LightPanda publishes no Windows
+binary, and the light tier has no native fallback — run the Compose stack or
+WSL2, where the Linux rows apply.</li>
+</ul>
+<h2 id="setup">Setup</h2>
+<pre><code class="language-sh">brew install node          # Node 20+ (npx ships with it); on Linux, any Node 20+
+cargo build --release -p crw-server --features cdp,camofox,impersonated
+./target/release/crw-server setup --camofox   # pre-download LightPanda + Camoufox engine (~300 MB)
 </code></pre>
-<h3 id="using-searxng-instead-opt-in">Using SearXNG instead (opt-in)</h3>
-<p>Start the SearXNG profile and set <code>searxng_url</code>. Camofox takes precedence when both are configured, so
-also clear <code>[renderer.camofox]</code> if you want SearXNG to serve search:</p>
-<pre><code class="language-bash">docker compose --profile searxng up -d
-</code></pre>
-<pre><code class="language-toml">[search]
-searxng_url = &quot;http://searxng:8080&quot;
-</code></pre>
-<p>To point CRW at an <strong>external</strong> SearXNG instead of the sidecar, override it without editing the file:</p>
-<pre><code class="language-yaml">services:
-  crw:
-    environment:
-      - CRW_SEARCH__SEARXNG_URL=http://your-searxng-host:8080   # env wins over the config file
-</code></pre>
-<blockquote>
-<p><strong>Two different URLs — don&#39;t confuse them.</strong> <code>SEARXNG_BASE_URL</code> (set on the <code>searxng</code> service) is
-SearXNG&#39;s <em>own</em> self-reference for the links it renders. <code>[search].searxng_url</code> /
-<code>CRW_SEARCH__SEARXNG_URL</code> is the host <strong>CRW</strong> calls. They happen to share the value <code>searxng:8080</code> in the
-bundled stack, but they serve different roles.</p>
-</blockquote>
-<blockquote>
-<p><strong>Cold start.</strong> <code>crw</code> waits for <code>searxng</code> to report healthy (<code>depends_on: condition: service_healthy</code>),
-so the first search after <code>docker compose up</code> can take ~15–30 s once the images are present (longer on the
-first pull). A <code>target_unreachable</code> or <code>timeout</code> error in the first few seconds usually just means SearXNG
-hasn&#39;t finished booting yet — the server logs the configured search host at startup so you can confirm it.</p>
-</blockquote>
-<h2 id="dockerfile">Dockerfile</h2>
-<p>Multi-stage build for minimal image size:</p>
-<pre><code class="language-dockerfile">FROM rust:1.93-bookworm AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release --bin crw-server --features crw-server/cdp
+<p><code>setup</code> resolves the host pair from the table above and refuses anything
+outside it. The runtime lookup is looser: LightPanda is found on <code>PATH</code> first,
+then <code>~/.crw/lightpanda</code>, and only then auto-downloaded — so a manual binary
+(any arch you can run) still feeds the light tier on a host upstream stops
+shipping.</p>
+<p><code>config.local.toml</code> (picked up automatically):</p>
+<pre><code class="language-toml"># crw-native.example.toml — copy to config.local.toml (git-ignored) and run
+# `crw-server` (or `make native-run`).
+[renderer]
+mode = &quot;auto&quot;
+manage_browsers = true      # crw spawns the light tier (LightPanda) itself.
+                            # The stock [renderer.lightpanda] default URL
+                            # counts as &quot;not explicitly configured&quot;: nothing
+                            # listening on 9222 ⇒ managed; a live server
+                            # there (or a custom ws_url) ⇒ external.
 
-FROM debian:bookworm-slim
-RUN apt-get update &amp;&amp; apt-get install -y ca-certificates &amp;&amp; rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/crw-server /usr/local/bin/crw-server
-COPY config.default.toml /app/config.default.toml
-WORKDIR /app
-EXPOSE 3000
-CMD [&quot;crw-server&quot;]
+[renderer.camofox]
+base_url = &quot;http://127.0.0.1:9377&quot;
+manage = true               # crw spawns/adopts camofox-browser on demand
+challenge_wait_ms = 20000
+clearance_reuse = true
+
+[search]
+enabled = true              # served through the managed Camofox, no SearXNG
 </code></pre>
-<h2 id="custom-configuration">Custom Configuration</h2>
-<p>Override settings via environment variables:</p>
-<pre><code class="language-yaml">services:
-  crw:
-    build: .
-    ports:
-      - &quot;8080:8080&quot;
-    environment:
-      - RUST_LOG=debug
-      - CRW_SERVER__PORT=8080
-      - CRW_CRAWLER__REQUESTS_PER_SECOND=5.0
-      - CRW_CRAWLER__USER_AGENT=MyBot/1.0
-      - CRW_AUTH__API_KEYS=[&quot;sk-production-key&quot;]
-      - CRW_RENDERER__LIGHTPANDA__WS_URL=ws://lightpanda:9222
+<pre><code class="language-sh">make native-run    # == cargo run --release -p crw-server --features cdp,camofox,impersonated
+curl -s localhost:3000/healthz
 </code></pre>
-<h2 id="production-tips">Production Tips</h2>
-<h3 id="resource-limits">Resource Limits</h3>
-<pre><code class="language-yaml">services:
-  crw:
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: &quot;1.0&quot;
+<h2 id="what-manage-true-actually-does">What <code>manage = true</code> actually does</h2>
+<ul>
+<li><strong>Lazy wake.</strong> No Camofox process exists until the first request that needs
+the stealth tier or a <code>/v1/search</code>. That request waits for readiness
+(seconds; only the very first run pays the engine download — that&#39;s what
+<code>setup --camofox</code> is for).</li>
+<li><strong>Adoption.</strong> If something already answers <code>/health</code> on the endpoint (a
+second crw instance, a leftover daemon), it is adopted, never duplicated.</li>
+<li><strong>Respawn.</strong> A crashed or idle-exited server is respawned by the next
+request that needs it. The breaker reports the failure like any tier
+connection error.</li>
+<li><strong>Reaping.</strong> Spawned servers lead their own process group, registered in
+crw&#39;s browser-registry; Ctrl-C, SIGTERM, and the early-exit paths all
+group-kill the Node server <em>and</em> its Firefox grandchildren. <code>~/.crw/camofox/server.log</code>
+captures their output for debugging.</li>
+<li><strong>Loopback only.</strong> <code>manage = true</code> requires a loopback <code>base_url</code> (the
+spawned server binds <code>127.0.0.1</code>, auth disabled — safe only on loopback).
+Anything else is rejected at boot.</li>
+<li><strong>Defaults are safe.</strong> Both switches default <code>false</code>; container
+deployments and the published image behave exactly as before.</li>
+</ul>
+<h2 id="byparr">Byparr</h2>
+<p>There is no native Byparr build. Three supported postures:</p>
+<ol>
+<li><strong>Omit it</strong> (default here). Camofox&#39;s own &quot;Just a moment&quot; wait plus the
+per-host <code>cf_clearance</code> cache still clear many Cloudflare sites; the
+ladder degrades gracefully without the solver.</li>
+<li><strong>Remote solver</strong>: point <code>[renderer.byparr].base_url</code> at a Byparr on a
+cheap server (never publish it publicly — it has no auth).</li>
+<li><strong>Containerized, alone</strong>: the Byparr image is multi-arch (native arm64),
+so running just that one service (OrbStack/colima) is cheap if you want
+the solver locally.</li>
+</ol>
+<h2 id="fingerprint-note-measure-before-trusting">Fingerprint note (measure before trusting)</h2>
+<p>Native Camofox renders on the host it runs on: its fonts, GPU and OS claims
+differ from the containerized Linux profile, and they differ per host — a Mac
+claims macOS, an x86_64 server claims Linux. Pin the generation OS to the
+platform you want the fingerprint to claim, so it stays internally consistent:</p>
+<pre><code class="language-sh">export CAMOFOX_OS=macos   # windows | macos | linux (comma list accepted too)
 </code></pre>
-<p>crw uses ~3 MB idle and ~66 MB under heavy load (50 concurrent requests), so 256 MB is generous.</p>
-<h3 id="health-check">Health Check</h3>
-<pre><code class="language-yaml">services:
-  crw:
-    healthcheck:
-      test: [&quot;CMD&quot;, &quot;curl&quot;, &quot;-f&quot;, &quot;http://localhost:3000/health&quot;]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-</code></pre>
-<h3 id="persistent-config">Persistent Config</h3>
-<pre><code class="language-yaml">services:
-  crw:
-    volumes:
-      - ./my-config.toml:/app/config.default.toml:ro
-</code></pre>
-<h3 id="logging">Logging</h3>
-<pre><code class="language-yaml">services:
-  crw:
-    environment:
-      - RUST_LOG=crw_server=info,crw_renderer=warn
-    logging:
-      driver: json-file
-      options:
-        max-size: &quot;10m&quot;
-        max-file: &quot;3&quot;
-</code></pre>
+<p>The supervisor overrides only its own contract (<code>CAMOFOX_HOST</code>, <code>_PORT</code>,
+<code>_AUTH_MODE</code>, <code>_ALLOW_PRIVATE_NETWORK</code>, <code>_HEADLESS</code>) and inherits the rest of
+your environment, so the export reaches the spawned server on every host.</p>
+<p>If a site behaves worse than the Docker baseline, either drop that
+<code>[renderer.camofox]</code> section back to a containerized endpoint (compose
+still works side-by-side) or run the whole stack in Docker for that workload.</p>
+<h2 id="comparison-measured-m-series-pinned-versions">Comparison (measured, M-series, pinned versions)</h2>
+<p>The Apple-Silicon case, which is where the gap is widest: on x86_64 the
+container&#39;s Firefox is already unemulated, so the VM reservation is the saving.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Compose stack</th>
+<th>Native</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host RAM reserved by container VM</td>
+<td>8 GiB VM (≈2.2 GiB guest-in-use when idle)</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Camofox Firefox</td>
+<td>~1.13 GiB, emulated amd64</td>
+<td>~460 MB, native arm64</td>
+</tr>
+<tr>
+<td>Byparr resident</td>
+<td>~456 MB</td>
+<td>— (omit/remote)</td>
+</tr>
+<tr>
+<td>Idle before first heavy request</td>
+<td>all containers up</td>
+<td>~110 MB (crw + LightPanda)</td>
+</tr>
+</tbody></table>
 </article>
     </main>
 
@@ -533,6 +580,6 @@ CMD [&quot;crw-server&quot;]
   <script type="module" src="/js/theme.js"></script>
   <script type="module" src="/js/search.js"></script>
   <script type="module" src="/js/app.js"></script>
-  <script>window.__INITIAL_SLUG__ = "docker";</script>
+  <script>window.__INITIAL_SLUG__ = "native-macos";</script>
 </body>
 </html>

@@ -447,7 +447,7 @@ console.log(body.data.markdown);
 <td><code>headers</code></td>
 <td>object</td>
 <td><code>{}</code></td>
-<td>Custom HTTP headers</td>
+<td>Custom HTTP headers, forwarded on the HTTP and LightPanda render paths (camofox renders do not apply them). A <code>User-Agent</code> here overrides the default. On a LightPanda render they apply to every request the page makes (subresources included), so avoid putting cross-origin-sensitive credentials like <code>Authorization</code> here.</td>
 </tr>
 <tr>
 <td><code>cssSelector</code></td>

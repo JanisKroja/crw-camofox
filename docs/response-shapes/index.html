@@ -351,10 +351,18 @@ crw search "renewable energy trends 2024" --json --fields title,url,snippet --li
     &quot;links&quot;: [
       &quot;https://example.com&quot;,
       &quot;https://example.com/about&quot;
+    ],
+    &quot;sitemaps&quot;: [
+      &quot;https://example.com/sitemap.xml&quot;,
+      &quot;https://example.com/product-sitemap.xml&quot;
     ]
   }
 }
 </code></pre>
+<p><code>sitemaps</code> lists the sitemap documents CRW fetched and parsed while discovering
+the site. It is empty when <code>useSitemap</code> is <code>false</code> or the site exposes no
+reachable sitemap, and partial when discovery stops early on <code>limit</code> or
+<code>timeout</code>. Sitemap files are kept out of <code>links</code> because they are not pages.</p>
 <h2 id="search">Search</h2>
 <p><code>data</code> is a wrapper around the actual results. When you do not use any LLM feature, the wrapper still holds the results in <code>data.results</code> and the other fields stay empty/null.</p>
 <pre><code class="language-json">{
