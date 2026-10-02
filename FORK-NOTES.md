@@ -33,6 +33,25 @@ Tests: `cargo test -p crw-search` (105 pass, incl. new cases for the navigate
 bodies and the chrome predicate); `cargo fmt --check` and
 `cargo clippy -p crw-search --all-features` clean.
 
+### `feat(renderer)`: native (Docker-free) mode — merged into trunk
+
+`feat/native-macos` (`8ac6553a`, `f1bcbbc1`) was fast-forward merged into
+`feat/camofox-renderer` and its remote branch deleted. One trunk now carries
+**two deployment targets of the same binary**, selected by config, not by
+branch or build pipeline:
+
+| Target | How | Browser processes |
+|---|---|---|
+| Docker (production contract) | `docker compose up` (image builds `cdp,camofox,impersonated`) | Compose sidecars; `manage` flags stay unset |
+| Native (single machine, Apple Silicon) | `make native-run` + `config.local.toml` from `crw-native.example.toml` | crw spawns/adopts/reaps them (`[renderer] manage_browsers`, `[renderer.camofox] manage`) |
+
+Keep it that way: the Dockerfile builds the same feature set native mode
+needs, both manage switches default off (container deployments byte-for-byte
+unchanged), and the shared camofox REST client is where protocol fixes land
+(the tab-leak fix benefits both targets). A long-lived `native` branch would
+fork `crw-renderer`/`crw-search` and force every protocol fix to be ported
+twice — do not recreate that split.
+
 ## Building / running locally
 
 The compose stack normally uses the published image; this fork runs the local
@@ -43,6 +62,11 @@ git-ignored upstream) and:
 ```sh
 docker compose build crw && docker compose up -d
 ```
+
+Native alternative (no Docker, same trunk): `cargo build --release -p
+crw-server --features cdp,camofox,impersonated` (or `make native-run`), with
+the manage flags enabled per [`crw-native.example.toml`](crw-native.example.toml)
+— details in [`docs/docs/native-macos.md`](docs/docs/native-macos.md).
 
 ## Tracking upstream
 
