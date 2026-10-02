@@ -93,6 +93,7 @@ export default {
       children: [
         { title: "Self-Hosting", slug: "self-hosting", icon: "server" },
         { title: "Docker", slug: "docker", icon: "box" },
+        { title: "Native Mode (no Docker)", slug: "native-macos", icon: "box" },
         { title: "Configuration", slug: "configuration", icon: "settings" },
         { title: "Hardening", slug: "self-hosting-hardening", icon: "alert" },
         { title: "JS Rendering", slug: "js-rendering", icon: "zap" },

@@ -129,12 +129,13 @@ ladder, Cloudflare solving and search. No auth by default. Set `CRW_HOST_PORT`
 and `CRW_BIND_ADDRESS` in `.env` to change the published port or bind to
 `127.0.0.1` only.
 
-**No Docker?** On a single machine (Apple Silicon) crw can run the whole ladder
-natively and own the browser processes itself: copy
-[`crw-native.example.toml`](crw-native.example.toml) to `config.local.toml` and
-run `make native-run` — Camofox and LightPanda are spawned on demand, with no
-container VM and a native arm64 Firefox instead of the amd64 image under
-emulation. See [`docs/docs/native-macos.md`](docs/docs/native-macos.md).
+**No Docker?** On a single machine crw can run the whole ladder natively and own
+the browser processes itself: copy [`crw-native.example.toml`](crw-native.example.toml)
+to `config.local.toml` and run `make native-run` — Camofox and LightPanda are
+spawned on demand, with no container VM. Works on Linux and macOS, `x86_64` and
+`aarch64` (CI exercises Linux x86_64). Apple Silicon gains the most, because the
+published camofox image is amd64-only and Docker runs it there as an emulated
+Firefox. See [`docs/docs/native-macos.md`](docs/docs/native-macos.md).
 
 **Scrape a page:**
 

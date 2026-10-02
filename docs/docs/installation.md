@@ -76,7 +76,7 @@ docker run -p 3000:3000 ghcr.io/adambenhassen/crw-camofox:latest
 docker compose up
 ```
 
-The Docker image uses a multi-stage build: `rust:1.93-bookworm` for building, `debian:bookworm-slim` for runtime. The compose file includes a LightPanda sidecar for JS rendering.
+The Docker image uses a multi-stage build: `rust:1.98-bookworm` for building, `debian:bookworm-slim` for runtime. Build your own binaries with a matching toolchain — the `impersonated` tier pulls `wreq`, whose current release requires rustc ≥ 1.98, so an older cargo refuses to resolve it. The compose file includes a LightPanda sidecar for JS rendering.
 
 ## JS Rendering Setup
 
@@ -93,7 +93,7 @@ lightpanda serve --host 127.0.0.1 --port 9222 --block-private-networks &
 crw-server
 ```
 
-The `setup` command detects your platform (Linux x86_64, macOS aarch64) and downloads the appropriate LightPanda binary to `~/.local/bin/lightpanda`.
+The `setup` command detects your platform (Linux x86_64/aarch64, macOS x86_64/aarch64 — the four LightPanda nightlies) and downloads the appropriate binary to `~/.local/bin/lightpanda`. On a single machine you can skip this section entirely and let crw own the browsers instead: that is *native mode*, documented in `docs/docs/native-macos.md`.
 
 ### Other CDP backends
 

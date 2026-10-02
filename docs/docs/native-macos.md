@@ -1,33 +1,75 @@
-# Native mode (Apple Silicon, no Docker)
+# Native mode (no Docker)
 
 The Docker Compose stack is the production contract: sidecar isolation
 (`read_only`, `cap_drop ALL`, pinned images), and it runs unchanged on any
 Linux server. On a single machine — a developer laptop, a work Mac — the VM
-that Compose requires is pure overhead: on Apple Silicon it reserves several
-GB of RAM, and worse, the published `camofox-browser` image is `linux/amd64`
-only, so the stealth/search tier runs a fully **emulated x86 Firefox** inside
-it (~1.1 GB measured, vs ~460 MB for the same work natively).
+that Compose requires is pure overhead: it reserves several GB of RAM, and on
+Apple Silicon the published `camofox-browser` image is `linux/amd64` only, so
+the stealth/search tier runs a fully **emulated x86 Firefox** inside it
+(~1.1 GB measured, vs ~460 MB for the same work natively).
 
 Native mode deletes the VM from the picture:
 
 | Component | Native form | Obtained by |
 |---|---|---|
-| `crw-server` | arm64 Rust binary | `cargo build --release -p crw-server --features cdp,camofox,impersonated` |
-| LightPanda (light JS tier) | `lightpanda-aarch64-macos` binary | auto-downloaded to `~/.crw/lightpanda` (or PATH) |
-| Camofox (heavy/stealth tier + `/v1/search`) | `npx camofox-browser@<pin>` + the pinned Camoufox engine (`mac.arm64`) in `~/Library/Caches/camoufox` | spawned on demand by crw |
+| `crw-server` | native Rust binary (`x86_64` and `aarch64`) | `cargo build --release -p crw-server --features cdp,camofox,impersonated` |
+| LightPanda (light JS tier) | `lightpanda-<arch>-<os>` nightly | auto-downloaded to `~/.crw/lightpanda` (or PATH) |
+| Camofox (heavy/stealth tier + `/v1/search`) | `npx camofox-browser@<pin>` + the pinned Camoufox engine for your platform | spawned on demand by crw; `camoufox-js` fetches the engine into `~/Library/Caches/camoufox` (macOS) or `~/.cache/camoufox` (Linux) |
 | Byparr (Cloudflare solver) | *no native build exists* | optional; keep remote — see below |
 
 Idle footprint becomes `crw-server` (~50 MB) + LightPanda (~64 MB); Camofox
 starts **only when a request first needs it** and its own idle policy closes
 the browser between bursts.
 
+## Host coverage
+
+Everything measured below comes from an Apple-Silicon laptop, because that is
+where native mode pays most. Nothing in the code is arm64-only:
+
+| Host | `crw-server` | LightPanda tier | Camofox engine |
+|---|---|---|---|
+| macOS aarch64 (Apple Silicon) | ✅ | ✅ `lightpanda-aarch64-macos` | ✅ `mac.arm64` |
+| macOS x86_64 (Intel) | ✅ | ✅ `lightpanda-x86_64-macos` | ✅ `mac.x86_64` |
+| Linux x86_64 | ✅ | ✅ `lightpanda-x86_64-linux` | ✅ `lin.x86_64` |
+| Linux aarch64 | ✅ | ✅ `lightpanda-aarch64-linux` | ✅ `lin.arm64` |
+| Windows | CI never builds it (untested) | ❌ no upstream binary | ✅ `win.x86_64` |
+
+The `crw-server` column is what `cargo build` yields — the workspace has no
+arch-gated code — but CI only exercises Linux x86_64, so the other rows are
+inference rather than measurement. The two browser columns are upstream's own
+published artefact names, verified against the LightPanda `nightly` release and
+the Camoufox release manifest.
+
+* The Rust side is arch-neutral: no `target_arch` gating anywhere, and CI
+  builds and tests the shipping feature set (`cdp,camofox,impersonated`) on
+  x86_64 Linux.
+* The LightPanda table in `crw-renderer`/`crw-server`/`crw-cli` mirrors
+  upstream's exactly four nightlies; a unit test pins the names so a missing
+  arm goes red instead of silently dropping the light tier.
+* The Camoufox engine is fetched by `camoufox-js`, which resolves the platform
+  itself — crw never picks an arch, so a fresh host simply downloads its own.
+* **x86_64 hosts win less.** The published `camofox-browser` image is amd64, so
+  in Docker that Firefox is already native: going native there drops the VM
+  and its reserved RAM and buys lazy wake, but not the ~600 MB of emulation.
+* **Windows is out of scope for these notes.** Nothing gates it in the source
+  (`cfg(unix)` covers the POSIX process-group reaping, with a `start_kill`
+  fallback), but this fork's CI is Linux-only, LightPanda publishes no Windows
+  binary, and the light tier has no native fallback — run the Compose stack or
+  WSL2, where the Linux rows apply.
+
 ## Setup
 
 ```sh
-brew install node          # Node 20+ (npx ships with it)
+brew install node          # Node 20+ (npx ships with it); on Linux, any Node 20+
 cargo build --release -p crw-server --features cdp,camofox,impersonated
 ./target/release/crw-server setup --camofox   # pre-download LightPanda + Camoufox engine (~300 MB)
 ```
+
+`setup` resolves the host pair from the table above and refuses anything
+outside it. The runtime lookup is looser: LightPanda is found on `PATH` first,
+then `~/.crw/lightpanda`, and only then auto-downloaded — so a manual binary
+(any arch you can run) still feeds the light tier on a host upstream stops
+shipping.
 
 `config.local.toml` (picked up automatically):
 
@@ -93,19 +135,27 @@ There is no native Byparr build. Three supported postures:
 
 ## Fingerprint note (measure before trusting)
 
-Native Camofox renders on macOS: its fonts, GPU and OS claims differ from
-the containerized Linux profile. Pin the generation OS to match the platform
-so the fingerprint is internally consistent:
+Native Camofox renders on the host it runs on: its fonts, GPU and OS claims
+differ from the containerized Linux profile, and they differ per host — a Mac
+claims macOS, an x86_64 server claims Linux. Pin the generation OS to the
+platform you want the fingerprint to claim, so it stays internally consistent:
 
 ```sh
-export CAMOFOX_OS=macos   # passed through to the spawned server
+export CAMOFOX_OS=macos   # windows | macos | linux (comma list accepted too)
 ```
+
+The supervisor overrides only its own contract (`CAMOFOX_HOST`, `_PORT`,
+`_AUTH_MODE`, `_ALLOW_PRIVATE_NETWORK`, `_HEADLESS`) and inherits the rest of
+your environment, so the export reaches the spawned server on every host.
 
 If a site behaves worse than the Docker baseline, either drop that
 `[renderer.camofox]` section back to a containerized endpoint (compose
 still works side-by-side) or run the whole stack in Docker for that workload.
 
 ## Comparison (measured, M-series, pinned versions)
+
+The Apple-Silicon case, which is where the gap is widest: on x86_64 the
+container's Firefox is already unemulated, so the VM reservation is the saving.
 
 | | Compose stack | Native |
 |---|---|---|

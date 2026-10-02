@@ -43,7 +43,7 @@ branch or build pipeline:
 | Target | How | Browser processes |
 |---|---|---|
 | Docker (production contract) | `docker compose up` (image builds `cdp,camofox,impersonated`) | Compose sidecars; `manage` flags stay unset |
-| Native (single machine, Apple Silicon) | `make native-run` + `config.local.toml` from `crw-native.example.toml` | crw spawns/adopts/reaps them (`[renderer] manage_browsers`, `[renderer.camofox] manage`) |
+| Native (single machine; Linux/macOS, `x86_64` & `aarch64`) | `make native-run` + `config.local.toml` from `crw-native.example.toml` | crw spawns/adopts/reaps them (`[renderer] manage_browsers`, `[renderer.camofox] manage`) |
 
 Keep it that way: the Dockerfile builds the same feature set native mode
 needs, both manage switches default off (container deployments byte-for-byte
