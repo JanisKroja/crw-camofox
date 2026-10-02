@@ -56,6 +56,21 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Native mode: the full ladder, Docker-free, on one machine.** With
+  `[renderer.camofox] manage = true` (loopback-only) crw owns the Camofox
+  endpoint lifecycle instead of Compose: it lazy-wakes a host-local
+  `camofox-browser` (PATH, or `npx -y` at the compose pin) on the first
+  stealth/search request, adopts an already-live server instead of
+  duplicating it, respawns after a crash or idle exit, and group-kills the
+  Node server and its Firefox tree on every shutdown path. With
+  `[renderer] manage_browsers = true` it also owns the LightPanda tier
+  (PATH → `~/.crw/lightpanda` → auto-download). Both switches default off;
+  container deployments are unchanged. `crw-server setup --camofox`
+  pre-downloads both browser engines; `make native-build` / `make native-run`
+  build and start the server with the full feature set. On Apple Silicon the
+  stealth tier runs native arm64 Firefox (~460 MB) instead of the
+  amd64-only image under emulation (~1.13 GiB) inside a several-GB VM. See
+  `docs/docs/native-macos.md` and `crw-native.example.toml`.
 - `crw_camofox_tab_leak_total{renderer,cause}` — counts a tab left open by a
   cancellation, an orphan reaped after its create answer was lost, and a close
   camofox accepted but did not perform. Empty in normal operation.

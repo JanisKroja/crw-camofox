@@ -6,669 +6,450 @@ This page is generated from the root [`CHANGELOG.md`](https://github.com/us/crw/
 The source of truth is the repository root changelog. Do not edit this docs page manually.
 :::
 
-All notable changes to CRW are documented here.
+All notable changes to this fork (`crw-camofox`) are documented here. This is a
+camofox-first, anti-detection variant of crw; entries below cover the fork's own
+`v1.x` line. The format follows [Keep a Changelog](https://keepachangelog.com/),
+and the project uses [Semantic Versioning](https://semver.org/).
 
-## [0.15.2](https://github.com/us/crw/compare/v0.15.1...v0.15.2) (2026-06-12)
+## [Unreleased]
 
+### Fixed
 
-### Bug Fixes
+- **camofox: tabs no longer leak when a fetch is cancelled or a create answer is
+  lost.** A cancelled fetch (a crawl's `handle.abort()`, or the outer request
+  timeout dropping the handler) used to leave its tab open, and so did a
+  `POST /tabs` whose response never arrived — camofox registers the tab
+  server-side *before* it replies with the id. Those tabs are not self-healing:
+  camofox's idle reaper only collects zero-tab sessions, so each one holds a
+  slot of the session's `MAX_TABS_PER_SESSION` (10 by default) for the full 30 min
+  session timeout, and ten of them turn every later create into a 429. The fetch
+  tab is now held by a guard that closes it inline on every normal path and, if
+  the future was dropped, reaps it from a detached task; an interrupted or
+  unanswered create lists the session and closes the tab it cannot account for,
+  confirmed by re-listing.
+- **camofox (search): a warm tab abandoned after a dropped connection is now
+  closed, not just forgotten.** A client timeout already replaced the tab; a
+  transport error kept the id cached while its page stayed alive server-side,
+  working through the same tab cap. A tab the server itself reported gone
+  (404/5xx) is still not DELETEd — that is the server's own word that it already
+  reaped it.
+- **camofox (search): a tab that cannot be closed now says so.** A close that
+  never reached the server, or outlasted its budget, was logged at `debug` on
+  the theory that camofox usually finishes it — but the budget was shorter than
+  the server's own allowance for a page close, so giving up meant the server was
+  genuinely wedged and the tab was really still there. It is a `warn` now, and
+  the budget sits above that allowance. Likewise a `POST /tabs` that answers 2xx
+  without a usable id — camofox registers the tab before it replies, so that one
+  is a leak, not a stall, and it is no longer reported as a generic bad response.
+- **camofox (search): the close of an abandoned tab is no longer something the
+  search waits on, or gives up on.** It was issued inline under a 2 s budget —
+  shorter than the 5 s camofox itself allows the page close, on a tab whose
+  navigate the server may still be working. Hanging up first left the tab listed
+  with nobody in this client able to notice (there is no list-and-reap here), and
+  one was seen living out its full 30 min session timeout while the search
+  reported clean results. The close now runs detached, under a budget longer
+  than the server's own.
+- **camofox (search): no tab create can be cancelled any more.** This client has
+  one closer — `close_tab`, by id — and no way to list what it is missing, so a
+  `POST /tabs` dropped mid-request was a tab whose id would never be known: a
+  slot of the session's tab cap, gone until the session timeout. Every create
+  now runs in a task that outlives the request that wanted it and publishes its
+  id where the next search adopts it, so waiting can be bounded (which is what
+  made the cancellation tempting in the first place) without losing anything.
+- The tab-close budget no longer produces a leak signal when only the *client*
+  gave up: camofox allows its own `safePageClose` 5 s against our shorter
+  timeout, so that close usually lands anyway.
 
-* **mcp:** npm launcher downloads binary when platform pkg missing ([4ae1aa6](https://github.com/us/crw/commit/4ae1aa684f93c4c6a36fe157ce013700c5a9e6ea))
+### Added
 
-## [0.15.1](https://github.com/us/crw/compare/v0.15.0...v0.15.1) (2026-06-11)
+- **Native mode: the full ladder, Docker-free, on one machine.** With
+  `[renderer.camofox] manage = true` (loopback-only) crw owns the Camofox
+  endpoint lifecycle instead of Compose: it lazy-wakes a host-local
+  `camofox-browser` (PATH, or `npx -y` at the compose pin) on the first
+  stealth/search request, adopts an already-live server instead of
+  duplicating it, respawns after a crash or idle exit, and group-kills the
+  Node server and its Firefox tree on every shutdown path. With
+  `[renderer] manage_browsers = true` it also owns the LightPanda tier
+  (PATH → `~/.crw/lightpanda` → auto-download). Both switches default off;
+  container deployments are unchanged. `crw-server setup --camofox`
+  pre-downloads both browser engines; `make native-build` / `make native-run`
+  build and start the server with the full feature set. On Apple Silicon the
+  stealth tier runs native arm64 Firefox (~460 MB) instead of the
+  amd64-only image under emulation (~1.13 GiB) inside a several-GB VM. See
+  `docs/docs/native-macos.md` and `crw-native.example.toml`.
+- `crw_camofox_tab_leak_total{renderer,cause}` — counts a tab left open by a
+  cancellation, an orphan reaped after its create answer was lost, and a close
+  camofox accepted but did not perform. Empty in normal operation.
+- `renderer.camofox.reap_orphan_tabs` (default on, `manage = true` required) to
+  turn the orphan reap off; see `docs/docs/configuration.md`.
 
+## [1.5.0] - 2026-09-16
 
-### Bug Fixes
+A fingerprint release: a Chrome-impersonated HTTP tier sits between the plain
+fetch and the browser ladder, so pages that only check the TLS and HTTP/2
+handshake no longer cost a browser render. The Docker image ships the tier on
+by default.
 
-* **ci:** poll npm in verify_npm_sdk + expose ./package.json export ([ed185dd](https://github.com/us/crw/commit/ed185dd3fd34313e5babf1c9b71e08faab3918c5))
+### Added
 
-## [0.15.0](https://github.com/us/crw/compare/v0.14.0...v0.15.0) (2026-06-10)
+- **Renderer:** a Chrome-impersonated HTTP tier (`[renderer.impersonated]`,
+  on by default in the Docker image). It presents a real Chrome TLS/JA3/HTTP2
+  fingerprint with no browser and no JavaScript, runs between the plain HTTP
+  fetch and the browser ladder on wall-shaped results or fingerprint-shaped
+  transport errors, and never on pages that need JavaScript or on vendor
+  walls that do. Pin it with `renderer: "impersonated-http"`; `renderJs:
+  true` alongside the pin is rejected. Per-request `proxy` and `stealth`
+  overrides bypass the hop. The tier is on by default in the Docker image and
+  adds its 15 s budget to the auto-extended request deadline; set `enabled =
+  false` to opt out.
 
+### Changed
 
-### ⚠ BREAKING CHANGES
+- **Docker:** the image builder moved from Rust 1.93 to Rust 1.98, which the
+  impersonated tier's `wreq` dependency requires. Building the image now also
+  needs cmake and clang for BoringSSL; the arm64 leg cross-compiles it.
 
-* CrwClient() with no API key now targets the cloud and raises if unauthenticated, instead of running locally. Set CRW_LOCAL=1 for the previous zero-config local behavior.
+## [1.4.0] - 2026-09-15
 
-### Features
+A hardening release: the Camofox tier now waits out Cloudflare challenges and
+reuses the clearance it earns, a Byparr solver tier handles Turnstile
+checkboxes, and scrapes stop shipping error pages, walls and parking pages as
+content. Crawl and batch keep failed pages as marked documents, and the
+metrics and admin routes sit behind the API-key boundary.
 
-* add TypeScript SDK (crw-sdk) ([1dd96f7](https://github.com/us/crw/commit/1dd96f7037933f933773ef92d97b68af9134906a))
-* cloud-first default + full client SDK parity ([21e819e](https://github.com/us/crw/commit/21e819ed8a863929bb67323c8b8c4b37ac5f712f))
-* fold langchain/crewai adapters into crw.integrations extras ([cd49120](https://github.com/us/crw/commit/cd49120f957d23e06899d4628388e1aa8cd11842))
-* **release:** publish crw-cli (and crw-browse) to crates.io ([b3d8004](https://github.com/us/crw/commit/b3d80046be72f1495985f6f21485c6fbdae4da7c))
-* **search:** accept native SearXNG categories as passthrough ([b3bcc5d](https://github.com/us/crw/commit/b3bcc5d439fb37f214b76b96e053053765714e39))
+### Added
 
+- **Renderer:** the Camofox tier now waits, on the open tab, for a Cloudflare
+  "Just a moment" challenge to clear (`renderer.camofox.challenge_wait_ms`,
+  default 20 s, always inside the request deadline) instead of snapshotting
+  the interstitial and reporting the page as blocked.
+- **Renderer:** after a Camofox render that earned a `cf_clearance` cookie,
+  the tab's cookies and user agent are cached per host and sent with the
+  HTTP-tier fetch on later scrapes of that host, so they skip the browser.
+  A repeat challenge drops the entry. Off with
+  `renderer.camofox.clearance_reuse = false`; never used through a proxy.
+  The cache is used only when its `cf_clearance` cookie applies to the host
+  being fetched.
+- **Crawl:** `CrawlRequest.headers` (and v2 `scrapeOptions.headers`) reach
+  every page fetch. The nested `scrapeOptions` shape from the spec is accepted.
+- **Crawl / batch:** a page that could not be read (transport failure, CDN
+  origin error, wall, PDF or extraction failure) is returned as a document
+  marked through `block` and counted in a new `blocked` field, instead of
+  being dropped. Blocked v2 documents cost zero credits.
+- **Crawl:** a crawl whose every fetch failed ends `failed` with the last
+  fetch failure's reason instead of completing with zero pages.
+- **v2:** `GET /v2/{batch/scrape,crawl}/{id}/errors` lists each failed URL with
+  its reason. `/v2/scrape` honours `renderJs` and turns `location.languages`
+  into an `Accept-Language` header. v2 documents carry `llmUsage` when an LLM
+  ran, as `/v1` does.
+- **Map:** `/v1/map` responses include a `sitemaps` array of the sitemap documents that
+  answered with parseable content (kept out of `links`).
+- **Search:** `scrapeOptions.timeout` (1–60000 ms) sets the per-result scrape
+  budget; the default is 15 s instead of the full renderer ladder. Results
+  carry `truncated`.
+- **Docker:** `CRW_HOST_PORT` and `CRW_BIND_ADDRESS` set the published port
+  and host interface.
+- **Renderer:** a Byparr challenge-solver tier (`[renderer.byparr]`). The
+  ladder calls it last, and only when the HTTP tier or an earlier browser tier
+  returned an anti-bot challenge or wall. It clicks the Cloudflare Turnstile
+  checkbox, and the `cf_clearance` it earns feeds the same per-host cache as
+  Camofox (`renderer.byparr.clearance_reuse`). Pages that end on an internal
+  address are refused. Docker Compose runs Byparr by default.
 
-### Bug Fixes
+### Fixed
 
-* **antibot:** detect Google rate-limit/bot-wall pages served with HTTP 200 ([08bb46e](https://github.com/us/crw/commit/08bb46e5e41d9933e1c9603239938dbd500323fe))
-* **ci:** compile TS tests to JS so the SDK suite runs on Node 18/20 ([e1b7546](https://github.com/us/crw/commit/e1b75469af88cad612f93c64333508850864a981))
-* **extract:** avoid doubling chat/completions in structured base_url ([3816bb6](https://github.com/us/crw/commit/3816bb6713dc0932d0b06179f2e37927dba95dfb))
-* **map:** fold hyphen/underscore param spellings, add compare actions ([f34ae12](https://github.com/us/crw/commit/f34ae12844082db68d052b132c524eb5a4a4c9c1)), closes [#128](https://github.com/us/crw/issues/128)
-* **npm:** declare node&gt;=18 engines on crw-mcp packages ([3c953fe](https://github.com/us/crw/commit/3c953feaa3c01d18f0dc05f36be339cb68d31470))
-* **renderer:** reap CDP target + context on PoolGuard cancellation drop ([0eebadc](https://github.com/us/crw/commit/0eebadcb1a4360a0dad5b682301c181a0c328259))
+- **Renderer:** a caller-supplied `User-Agent` no longer travels with the
+  stealth mode's Chrome `Sec-Ch-Ua*` client hints. A blank `User-Agent` is
+  treated as absent.
+- **Renderer:** the escalation after LightPanda targeted a `chrome` tier this
+  fork never builds, so it always failed and Camofox was never reached. It now
+  escalates to Camofox. Custom request headers now reach LightPanda renders
+  too; Camofox renders still ignore them.
+- **Renderer:** Camofox renders report the page's real HTTP status instead of
+  200 for every page, including 404 and 403.
+- **Renderer:** when every browser tier rejects a page as an anti-bot wall, the
+  scrape fails instead of returning the wall, unless the page is larger than
+  an error page (so cleared Cloudflare pages still succeed).
+- **Renderer:** a forced-JS scrape whose browser tiers fail falls back to the
+  HTTP body it already fetched, with a `js_escalation_failed` warning.
+- **Renderer:** timeouts report the requested budget instead of the near-zero
+  overrun. A blackholed origin is reported as unreachable, not a timeout. An
+  unanswered proxy auth challenge is reported as a proxy authentication
+  failure. A request no longer returns to a proxy that already failed it.
+- **Renderer:** a dead Camofox proxy (Firefox `proxyConnectFailure`) now trips
+  the renderer breaker instead of counting as the site's fault. Anti-bot walls
+  no longer advance the breaker when a recovery tier exists.
+- **Renderer:** binary bodies (a NUL byte in the first 1 KB) fail with 422
+  instead of being decoded as HTML; a mislabelled PDF is detected by its
+  header.
+- **Scrape:** Cloudflare 520–527 origin-error pages, origin error pages
+  (>= 400 with little text), registrar parking pages, and Reddit, Cloudflare
+  and Vercel block pages served as 200 fail instead of shipping as content.
+  Cleared Cloudflare pages and thin but real pages are no longer reported as
+  blocks. A scrape whose requested formats all come back empty fails as
+  `no_usable_content`. Crawl and batch apply the same verdicts.
+- **Crawl:** a Camofox escalation that adds content below the LightPanda retry
+  threshold is kept. `truncated` follows the render that was kept.
+- **Crawl:** a complete non-HTML body (a JSON API response, say) that scores
+  low on the quality check no longer buys a browser render that was then
+  discarded.
+- **Extract:** `onlyMainContent` no longer deletes article bodies whose
+  wrappers are named after nearby layout (sidebar, nav, footer), keeps
+  `<header>`/`<aside>`/`<footer>` inside `<main>` or `<article>`, keeps
+  Elementor page content, and removes navigation menus. Non-HTML bodies are
+  left as they are.
+- **Extract:** `maxChars` and the LLM prompt cap count Unicode scalars, not
+  bytes. An LLM request whose connection closed before it reached the provider
+  is retried once. An extract URL whose page is a wall or error page fails
+  with that reason, and a job whose every URL failed charges no credits.
+- **Search:** Google result links resolve to their real URLs instead of Google
+  `/goto` redirects; consent and rate-limit redirects keep the original link.
+  `lang` is validated at the API boundary. Enrichment DNS checks run in
+  parallel.
+- **Research:** arXiv is a paper source again, and OpenAlex queries no longer
+  fail on `?` or `*`.
+- **Security:** the SSRF guard's DNS lookup is bounded at 8 s and no longer
+  blocks whole public /16 ranges. The CDP render tiers check every outbound
+  request (child frames included) against the SSRF rules, and LightPanda starts
+  with `--block-private-networks`. Error strings no longer contain internal
+  URLs or proxy credentials. PDF parsing moves to lopdf 0.42
+  (RUSTSEC-2026-0187).
+- **Security:** a per-request LLM `baseUrl` (BYOK) that points at a private,
+  loopback or link-local address is refused with 400 on scrape, v2 batch start
+  and search. Before, the server POSTed page content and the caller's key to
+  it. LLM calls no longer follow redirects to such addresses. The operator's
+  `[extraction.llm].base_url` is not restricted.
 
-## [0.14.0](https://github.com/us/crw/compare/v0.13.4...v0.14.0) (2026-06-08)
+### Changed
 
+- **Breaking:** `/metrics`, `/metrics/renderer-breakers`, and
+  `/admin/breakers/reset` now sit behind the API-key auth boundary. When
+  `[auth].api_keys` is set, Prometheus scrapes must send a Bearer token.
+- The Camofox tier refuses to return a page whose final URL (after redirects
+  and client-side navigation) is a private or internal address. This guards
+  what crw returns only: requests the browser makes on the way (a redirect hop,
+  subresources) still reach the network. camofox-browser's own private-network
+  check covers the URL it is asked to open, not redirects — verified live.
+- A Camofox fetch that lands on Firefox's own error page ("Problem loading
+  page") now fails as a navigation failure instead of returning that page.
+- CORS is no longer permissive. Browser callers need their origin listed in
+  `server.cors_allowed_origins`; the default sends no CORS headers. Entries
+  are matched as origins, so a trailing slash or capitals no longer disable
+  CORS silently; `*` is ignored with a warning.
+- **Breaking:** a malformed proxy URL is refused instead of ignored. A bad
+  `crawler.proxy` (or CLI `--proxy`) fails startup, and a bad per-request
+  `proxy` returns 400. Before, the value was logged and dropped, and traffic
+  went out directly from the server's own address.
+- An unreachable search backend now answers 502 instead of 422.
 
-### Features
+## [1.3.0] - 2026-09-13
 
-* **onboarding:** cloud-default messaging + api.fastcrw.com base URL ([4ccc92c](https://github.com/us/crw/commit/4ccc92c065027d900f0bd67e0273216bd76aa065))
-* **pdf:** PDF→markdown via pdf-inspector with Firecrawl-compatible parsers + /v2/parse ([196b153](https://github.com/us/crw/commit/196b153db011807a80a2b19155ef0605a3ca692b))
-* **search:** query-relevance rerank, list answers, multi-round latency guard ([ebafe83](https://github.com/us/crw/commit/ebafe8358283260df75a0d9629c59c8a1fcdad4a))
+A robustness release for the Camofox tier: search and render recover from the
+browser server's transient failures instead of wedging or stalling, pinned
+renders no longer die on the HTTP probe, and errors from the browser server
+finally say what went wrong.
 
+### Added
 
-### Bug Fixes
+- **Scrape:** an `images` output format returns the page's discovered images as
+  structured data (`[{url, alt}]`, flattened to `string[]` on v2) with
+  WHATWG-correct `srcset` parsing, instead of callers re-parsing HTML.
 
-* accept string env vars for auth.api_keys ([534f932](https://github.com/us/crw/commit/534f9320653c37aaba79e0db43ef9400b74b749b))
-* **pdf:** vendor test fixture into each crate (preflight: no cross-crate include) ([2c7bfe9](https://github.com/us/crw/commit/2c7bfe93bbd38a384e84dab6daa5ae0fd2e55c65))
-* **release:** scope out-of-crate include check to src/ only ([cd61fbf](https://github.com/us/crw/commit/cd61fbfd24046f6ef0a72e70e764189c39463fb6))
-* **release:** verify apt/homebrew by artifact, not flaky status-ack ([7a572fd](https://github.com/us/crw/commit/7a572fd6e5b39117d316377919387e9e7ec8ad3b))
+### Fixed
 
-## [0.13.4](https://github.com/us/crw/compare/v0.13.3...v0.13.4) (2026-06-07)
+- **Search:** a search that timed out on the reused warm tab left every later
+  search stalled behind the same dead tab until the process restarted. A
+  timeout on a reused tab now recreates the tab and retries once; a timeout
+  on a fresh tab swaps it out for the next search. The abandoned tab is
+  closed only after its replacement exists, so the browser context never
+  drops to zero tabs and hits Camofox's eager teardown.
+- **Search:** a failed `/evaluate` (Camofox answers a dead tab with a JSON
+  error, not an empty result) is treated as an upstream error so the stale-tab
+  recovery runs, instead of being reported as a clean empty result page.
+- **Search:** the response no longer blames SearXNG in error messages; the
+  backend is Camofox.
+- **Renderer:** tabs are created blank under a creation lock and navigated
+  with a separate call. Concurrent creates that navigated inside the create
+  raced for Camofox's initial blank page on a freshly relaunched context and
+  aborted each other, and each failure counted toward Camofox's
+  consecutive-failure breaker, which then closed the context. A create that
+  lands in Camofox's context relaunch window (`window is null`) is retried
+  with a growing pause inside the request deadline instead of failing the
+  render.
+- **Renderer:** when JS rendering is requested (which a pinned renderer
+  implies), an HTTP-tier failure now escalates to the JS tier the way auto
+  mode does. A Camofox-pinned scrape of an origin slower than the HTTP timeout
+  used to return `502` without ever reaching Camofox.
+- **Renderer:** pages whose HTML exceeds Camofox's 1 MiB single-result cap
+  are retrieved in slices. Previously the Camofox tier returned the server's
+  truncation placeholder as the document, so large pages (Wikipedia-sized
+  articles) came back empty and flagged as a loading placeholder.
+- **Renderer:** a navigate that Camofox reports as failed only because its
+  post-navigation ARIA snapshot timed out (large documents) no longer fails
+  the render; the page has loaded by then and the snapshot is unused.
+- **Renderer:** the Camofox tier is registered independently of the `cdp`
+  feature, and `renderer.mode = "camofox"` without a configured endpoint (or
+  in a binary built without the feature) is a startup configuration error
+  rather than a silent fall back to HTTP-only.
+- **Diagnostics:** Camofox's own error message (for example a persistent
+  profile pinned to an older Camoufox build) is carried into search and
+  renderer errors instead of a bare status; non-JSON bodies such as proxy
+  error pages are logged rather than surfaced to API clients. Rejected or
+  failed closes of abandoned tabs, and engine failures that the response
+  strips to a short reason, are now logged in full.
+- **MCP:** inline scrape content in search results is capped across results
+  to protect agent context.
+- **Release:** the internal crate version pins are synchronized with the
+  workspace version, so the CI version guard passes again.
 
+## [1.2.0] - 2026-07-18
 
-### Bug Fixes
+A hardening release: anti-bot detection accuracy, renderer recovery under blocked
+or dead egress, and map/search robustness — plus the camofox tier now respects
+the request deadline and search no longer fails silently.
 
-* **docker:** install aarch64 libc headers for cross-compile + CI guard ([8cd31ac](https://github.com/us/crw/commit/8cd31ac016177d3d2621e8ecfa03a027b1621a3a))
+### Added
 
-## [0.13.3](https://github.com/us/crw/compare/v0.13.2...v0.13.3) (2026-06-06)
+- **Map:** URL discovery on hard sites, with a configurable discovery limit.
+  SPA shells and sitemap-less sites now yield a real URL inventory instead of a
+  seed-only result.
+- **Map:** anti-bot-gated sitemaps (Cloudflare / JS challenge) are escalated
+  through the JS renderer, recovering the real sitemap XML instead of dropping it.
+- **Search:** per-request `country` is threaded into result-page scraping, so the
+  exit country of each scraped result follows the caller's geo.
 
+### Fixed
 
-### Bug Fixes
-
-* **release:** stop verify-publish reporting false failures ([d57c8c6](https://github.com/us/crw/commit/d57c8c6285a014031bcf310386e83493c7dcd2f2))
-
+- **Anti-bot detection:** challenge/interstitial pages are now reported as blocked
+  (`success: false`) instead of returning the challenge shell as content. Covers
+  modern Cloudflare Turnstile 200 interstitials, large (100–300 KB) managed
+  challenge pages whose marker sits deep in the body, full-HTML marker scanning
+  (previously capped at 80 KB), and HTTP-200 datacenter block shells. A detected
+  block clears the page body so callers get a clean verdict.
+- **Renderer recovery:** blocked-egress and connection-reset scrapes retry through
+  the fallback proxy; connect-timeout blackholes are recovered the same way with a
+  tighter connect timeout; a near-exhausted request budget no longer invokes a JS
+  tier that can only fabricate a timeout, and an unreachable origin now surfaces as
+  `422` rather than a generic `500`.
+- **Renderer:** CDP WebSocket host is resolved to an IP for the Chromium 148+
+  rebinding guard; thin pages that ship no executable JS are no longer sent to a
+  browser (the render would reveal nothing); a multibyte-safe slice guard prevents
+  a panic when scanning large pages.
+- **Search:** charset-aware decoding — Latin-1 / Windows-1252 pages are decoded
+  correctly instead of turning high bytes into replacement characters; each
+  per-result scrape carries its own error; answer-synthesis warnings are neutral.
+- **Search:** failed, hung, or zero-row engines are surfaced as response warnings
+  (via `unresponsive_engines`) instead of an invisible empty success.
+- **Camofox tier:** every REST operation is bounded by the remaining request
+  deadline instead of the fixed 30 s client timeout, so a stalled render can no
+  longer overrun the caller's deadline; tab cleanup keeps a small grace budget so
+  tabs are reaped rather than leaked.
+- **Security:** every sitemap URL (not just the seed) is resolve-validated against
+  the private-range blocklist before fetching, closing an SSRF path where a crafted
+  sitemap index could point a child at an internal address.
 
 ### Performance
 
-* **docker:** cross-compile arm64 instead of QEMU (2h -&gt; ~3min) ([a7cab42](https://github.com/us/crw/commit/a7cab423d11fd8a7474c587796f86eacf2c32df9))
+- HTML extraction runs off the async reactor, keeping the runtime responsive under
+  extraction-heavy load.
 
-## [0.13.2](https://github.com/us/crw/compare/v0.13.1...v0.13.2) (2026-06-06)
+## [1.1.2] - 2026-07-04
 
+### Fixed
 
-### Bug Fixes
+- **Renderer:** body text is counted past the detector window and the scan
+  survives a multibyte character straddling the window edge.
 
-* **server:** embed openapi spec inside the crate so it can publish ([e606cb9](https://github.com/us/crw/commit/e606cb9303cec3716b7dbffd4d848164486368ea))
+## [1.1.1] - 2026-07-02
 
-## [0.13.1](https://github.com/us/crw/compare/v0.13.0...v0.13.1) (2026-06-06)
+### Fixed
 
+- **Renderer:** the CDP target is reaped when a lightpanda fetch is cancelled;
+  the 429 proxy-retry is disabled when the proxy URL is malformed; the relaxed-TLS
+  fallback fires only on certificate errors.
+- **Search:** `fetch_expanded` short-circuits when the original fetch fails, and
+  C1 query-expansion overlap is skipped when `sources` is set (no double-scrape).
+- **Research API:** correct title recovery when merging duplicate paper hits,
+  arXiv-id extraction from string leaves, category folding into the search term,
+  URL-encoded date filters, Semantic-Scholar legs skipped without an S2 key, and a
+  concurrency permit released during backoff.
 
-### Bug Fixes
+### Changed
 
-* **release:** correct publish tier ordering + guard topology ([c84deed](https://github.com/us/crw/commit/c84deedeeeb2698f50d94247b770560cd6f3d0df))
+- **Stealth:** single source of truth for the Chrome major UA version.
+- **Search:** BYOK LLM config is built as a fail-closed allowlist.
 
-## [0.13.0](https://github.com/us/crw/compare/v0.12.1...v0.13.0) (2026-06-06)
+## [1.1.0] - 2026-06-27
 
+### Added
 
-### Features
+- **Search:** overlapping query-expansion scrape with the original query (C1).
+- **Search:** Firecrawl-compatible research API engine layer.
+- **Renderer:** relaxed-TLS fallback and 429 proxy-retry for the HTTP fetch tier.
+- **Extract:** optional `reasoning_effort` config field.
 
-* **search:** deterministic Wikidata entity-relation lookup (W3) ([aa96e3e](https://github.com/us/crw/commit/aa96e3e182fad6d8e2caf03628461515ca5aab7f))
+### Fixed
 
-
-### Bug Fixes
-
-* **release:** sync Cargo.lock internal crate versions to 0.12.1 ([b5fc8a5](https://github.com/us/crw/commit/b5fc8a5b988401bb2ecca6fdd3be328d1ccd683a))
-
-## [0.12.1](https://github.com/us/crw/compare/v0.12.0...v0.12.1) (2026-06-05)
-
-
-### Bug Fixes
-
-* **release:** bump internal dep pins and track them in release config ([0139ec2](https://github.com/us/crw/commit/0139ec247c7f328ef172646eac3de5e0f287c42a))
-* **release:** sync Cargo.lock with bumped internal dep versions ([5c89d60](https://github.com/us/crw/commit/5c89d6037e32435a49cfd4fbdf1c2ba05ad83ae8))
-
-## [0.12.0](https://github.com/us/crw/compare/v0.11.0...v0.12.0) (2026-06-05)
-
-
-### Features
-
-* **answer:** gated moat-hardening abstention (answer_guarded) ([7ef7f32](https://github.com/us/crw/commit/7ef7f32c085f4e01429b4afa6794c52836cdd4e6))
-* **mcp:** emit structuredContent for crw_search; bump protocol to 2025-06-18 ([0cd9a4f](https://github.com/us/crw/commit/0cd9a4fa0e338683b75c5719bc3c54cca3b2dba6)), closes [#89](https://github.com/us/crw/issues/89)
-* **search:** diagnose search config and name unreachable host ([#90](https://github.com/us/crw/issues/90)) ([25f9441](https://github.com/us/crw/commit/25f94410869e24cb79a7835e2f05627d0eb07351))
-* **search:** pin SearXNG infoboxes/answers as structured sources (W0) ([554f18c](https://github.com/us/crw/commit/554f18ce4747057a04ec64f9f983faf46a48dee2))
-
-
-### Bug Fixes
-
-* **search:** use resolvable searxng host in docker config ([#90](https://github.com/us/crw/issues/90)) ([d966021](https://github.com/us/crw/commit/d9660219d23bdd4364940c97c9911dd31e73567b))
-
-## [0.11.0](https://github.com/us/crw/compare/v0.10.0...v0.11.0) (2026-06-03)
-
-
-### Features
-
-* **api:** serve /openapi.json and /openapi-3.0.json from crw-server ([3dc79b4](https://github.com/us/crw/commit/3dc79b443b6a41c3f325865aaa6bccdf562fda49))
-* **docs:** ship OpenAPI spec, SKILL.md, and agent-shell ([2145c97](https://github.com/us/crw/commit/2145c977463b8d5577e5cf81d3c4106ea20eddb4))
-* **docs:** wave 1 — API surface unblock for AI agent citations ([9b28090](https://github.com/us/crw/commit/9b2809028cf8c1c666fd94cd9b11dcab50daa633))
-* **docs:** wave 2 — 15-page glossary cluster for AIO citations ([14cd7e1](https://github.com/us/crw/commit/14cd7e1db3f70cbd9dd7da08818b25d1e8688c71))
-* **extract:** wave 2 cache token telemetry + DeepSeek provider tag fix ([1b4f1aa](https://github.com/us/crw/commit/1b4f1aa4eec70657964864f8c7d134150b6e2354))
-* **mcp,cli,docs:** snippet alias + agent-shell polish for benchmark wins ([3472d13](https://github.com/us/crw/commit/3472d1333dd5520a481e226543e6271d940c145f))
-* **monitor:** add feature-gated self-host crw-monitor mode (M6) ([ff732f3](https://github.com/us/crw/commit/ff732f3a31a66cf97746e79f7e4017788841f94a))
-* **monitor:** add stateless change-tracking diff engine + LLM judge ([a078081](https://github.com/us/crw/commit/a07808127762b6d2acf248de65f0cb9d17aad2d6))
-* **monitor:** stateless change-tracking diff engine + LLM judge + self-host monitor ([dc432ce](https://github.com/us/crw/commit/dc432cef74e720afb4e8224bef7647212f220ed7))
-* **renderer:** add chrome_proxy tier + antibot-driven failover ([0e37e30](https://github.com/us/crw/commit/0e37e307b7dbe2bb52b0e4ef5b190fd2c1ec0217))
-* **search:** adaptive multi-round evidence-scout retrieval (gated) ([9dd3224](https://github.com/us/crw/commit/9dd32244eb3d072852f601ddfd538c019074c4b5))
-* **search:** commit-policy answer prompt to cut over-abstention ([#71](https://github.com/us/crw/issues/71)) ([cac7b29](https://github.com/us/crw/commit/cac7b29cbc78f358b3d4cc508ad9d97e250f8483))
-* **search:** gated calibrated-answer path to cut over-abstention ([#78](https://github.com/us/crw/issues/78)) ([a53225d](https://github.com/us/crw/commit/a53225d799082751dfe933b8fb3bae4c16d07a90))
-* **search:** gated page-2 fallback for thin reranked answer pools ([#77](https://github.com/us/crw/issues/77)) ([2a7f0ac](https://github.com/us/crw/commit/2a7f0ac247666e9e360dad4bc0f26da247d4355e))
-* **search:** gated synthesis temperature/seed for deterministic eval ([#81](https://github.com/us/crw/issues/81)) ([52a8c58](https://github.com/us/crw/commit/52a8c58edf3e81c84e8ca8317e46d8ac95a8bf94))
-* **search:** multi-query expansion for the answer path (gated, default off) ([#73](https://github.com/us/crw/issues/73)) ([4e387af](https://github.com/us/crw/commit/4e387afc0f3e979ce21b30842539e7e1b9b774df))
-* **search:** multi-variant query expansion for recall (gated) ([7bd093f](https://github.com/us/crw/commit/7bd093fa674c933b7c4206bbefb32cc2414bb471))
-* **search:** passage-level relevance gate for the answer path (gated, off) ([#75](https://github.com/us/crw/issues/75)) ([43ac625](https://github.com/us/crw/commit/43ac625caf60d49fa6ca6bfa7fdd54ad8a12418e))
-* **search:** RRF re-rank + junk/coverage/geo filter + query cleaning for answer path ([32efee6](https://github.com/us/crw/commit/32efee67ed4e180505de9e2aec05d489adc58a51))
-* **search:** RRF re-rank + junk/coverage/geo filter + query cleaning for answer path ([682fa1c](https://github.com/us/crw/commit/682fa1ccbe26a0cd919a2181831ad1c73b530642))
-* **search:** snippet-fallback (Pattern A) + bake calibrated-answer durable ([#79](https://github.com/us/crw/issues/79)) ([de1b1f1](https://github.com/us/crw/commit/de1b1f1eac4108095b3d6d7bdda97c035666102a))
-* **search:** wave 4 R1+R2 — aggregated llmUsage + per-leg max_tokens (v0.11.0) ([3570f82](https://github.com/us/crw/commit/3570f82e0e1fe00e9851dc405506bdd2f0e04c01))
-* **search:** wave 4 R1+R2 + bump 0.11.0 ([9ebd23d](https://github.com/us/crw/commit/9ebd23d9d658fb07700ffc4a3259fbe079763627))
-* **v2:** add Firecrawl /v2 API surface ([f793ec0](https://github.com/us/crw/commit/f793ec09c8c95dad142022f9579adb4c4e1cceb6))
-
-
-### Bug Fixes
-
-* **antibot:** strip inline data-URIs before classifier deep scan ([6f1cbd2](https://github.com/us/crw/commit/6f1cbd20b98f73df099f72b7ad08e41acada2a7e))
-* **browse:** address outbound hardening review feedback ([a3c2076](https://github.com/us/crw/commit/a3c2076ffdd8024579bf7ab97653816cb5bd3881))
-* **browse:** harden outbound URL handling ([c370972](https://github.com/us/crw/commit/c37097253c7df89a5cedb3ddb79e5c9386f75b1b))
-* **cli:** swap SearXNG default to 127.0.0.1 + actionable error hint ([618d41b](https://github.com/us/crw/commit/618d41b52c3fa0c971eb6c34ea98922f06ea094f))
-* **docker:** include OpenAPI specs in crw-api build context ([f70c7af](https://github.com/us/crw/commit/f70c7af6486a82d6bd86c9a7c1054c410f045877))
-* **docker:** include OpenAPI specs in crw-api build context ([0238138](https://github.com/us/crw/commit/0238138f832a507a70ed411d96ec0143cbb7333e))
-* **docs:** add 2 missing Firecrawl-shape shims caught by sapient ([22b3d54](https://github.com/us/crw/commit/22b3d5482ca224d0eebd76a795ed8428f108d080))
-* **extract:** accept deepseek/openai-compatible providers in structured extract ([2f0d86d](https://github.com/us/crw/commit/2f0d86d5245c24d388671299beb5acd76458c4ca))
-* **search:** default reranker to the proven lexical core ([#69](https://github.com/us/crw/issues/69)) ([06585b6](https://github.com/us/crw/commit/06585b60abd2093288e520157369f16286fd2737))
-* **search:** point engine at searxng-internal alias (search_rpc-only) ([#70](https://github.com/us/crw/issues/70)) ([110aee7](https://github.com/us/crw/commit/110aee729624b42d71b6f219f52dadd6d6bc6ddb))
-* **v2:** batch status mutates state in place (no O(n^2) snapshot copy) ([c03d359](https://github.com/us/crw/commit/c03d359cfdfc2b2cf4d9603cccff7a08e6c54c69))
-* **v2:** emit invalidURLs (not invalidUrls) on batch start ([611c54d](https://github.com/us/crw/commit/611c54ded77aaa962cb76ff504c11310c7005825))
-
+- **Map:** SPA shells are rendered during URL discovery (#166).
+- **Proxy:** an empty `CRW_CRAWLER__PROXY` normalizes to none (#154).
+- **Stealth:** UA and `Sec-Ch-Ua` bumped from Chrome 131 to 150; the "Mozilla"
+  UA prefix is stripped for lightpanda; a modern UA is sent on the CDP path.
+- **PDF:** sandbox child address space is bounded to prevent a false
+  `pdf_too_large`.
+- **Research API:** arXiv inspection resolved via Semantic Scholar.
 
 ### Performance
 
-* **search:** calibrated answer top_n 8-&gt;5 (4x faster, accuracy holds) ([#80](https://github.com/us/crw/issues/80)) ([751f8ee](https://github.com/us/crw/commit/751f8ee160d28b84d352e533864ca4043793d294))
-
-## [0.10.0](https://github.com/us/crw/compare/v0.9.1...v0.10.0) (2026-05-20)
-
-
-### Features
-
-* **detector:** add vendor-specific anti-bot block markers ([c88c508](https://github.com/us/crw/commit/c88c508fb90b166dfe3727fd5dfb4f1597e43667))
-* **renderer:** add chrome_proxy as 4th fallback tier ([b4da4f7](https://github.com/us/crw/commit/b4da4f79bb4d0ed71c25f14aaae5137d00f8b26b))
-* **renderer:** per-request country via CDP proxy auth ([11b4d32](https://github.com/us/crw/commit/11b4d32285ed8a4e6bee8f390c264f9fc0be1b1a))
-
-
-### Bug Fixes
-
-* **release:** harden npm publish + fix mcp-registry verifier ([9d4076f](https://github.com/us/crw/commit/9d4076fadd252a33e7887ee6e4925be8e6aa7d8e))
-* **renderer:** detect CloudFront/WAF 403 as bot-wall ([7e058b2](https://github.com/us/crw/commit/7e058b2915eff8b36d1186013e0810b2290492f4))
-* **renderer:** escalate JS tier on 4xx/5xx and vendor-detected blocks ([648c372](https://github.com/us/crw/commit/648c372ee5d52aed1459c22725be2e6d34d95afb))
-
-## [0.9.1](https://github.com/us/crw/compare/v0.9.0...v0.9.1) (2026-05-16)
-
-
-### Bug Fixes
-
-* **release:** sync crw-cli internal dep versions with workspace ([26c528e](https://github.com/us/crw/commit/26c528e737c5ed136d3c6e72da36b9324363805f))
-
-## [0.9.0](https://github.com/us/crw/compare/v0.8.3...v0.9.0) (2026-05-16)
-
-
-### Features
-
-* **cli:** add AI extraction flags and `crw setup --reset` ([912eea0](https://github.com/us/crw/commit/912eea0a1fa0db5a838560f2c25da44b3ee33d44))
-
-## [0.8.3](https://github.com/us/crw/compare/v0.8.2...v0.8.3) (2026-05-15)
-
-
-### Features
-
-* **cli:** two-phase auto-fallback for `crw <url>` scrape ([a871e54](https://github.com/us/crw/commit/a871e544443673751974a8dc5ebb4f2b0eafd59f))
-* **setup:** make config.toml the canonical source for `crw setup` ([b07c154](https://github.com/us/crw/commit/b07c1549932399a355d30e15632d424f0ad28b85))
-
-
-### Miscellaneous
-
-* release 0.8.2 ([38ae764](https://github.com/us/crw/commit/38ae7641b44d321150febc38eda530db3d572046))
-* release 0.8.3 ([efba1b3](https://github.com/us/crw/commit/efba1b308d6ac3a5e7a5bbd3f132514bf631e86b))
-
-## [0.8.2](https://github.com/us/crw/compare/v0.8.2...v0.8.2) (2026-05-15)
-
-
-### Features
-
-* **cli:** two-phase auto-fallback for `crw <url>` scrape ([a871e54](https://github.com/us/crw/commit/a871e544443673751974a8dc5ebb4f2b0eafd59f))
-* **setup:** make config.toml the canonical source for `crw setup` ([b07c154](https://github.com/us/crw/commit/b07c1549932399a355d30e15632d424f0ad28b85))
-
-
-### Miscellaneous
-
-* release 0.8.2 ([38ae764](https://github.com/us/crw/commit/38ae7641b44d321150febc38eda530db3d572046))
-
-## [0.8.2](https://github.com/us/crw/compare/v0.8.1...v0.8.2) (2026-05-14)
-
-
-### Bug Fixes
-
-* **release:** move crw-cli to unpublished and update dep versions ([7f121f6](https://github.com/us/crw/commit/7f121f6f731e7bfa311be48fa442e0049bbda16d))
-
-## [0.8.1](https://github.com/us/crw/compare/v0.8.0...v0.8.1) (2026-05-14)
-
-
-### Bug Fixes
-
-* **cli:** mark crw-cli as publish=false to fix release ([3104cc5](https://github.com/us/crw/commit/3104cc5acec6d6a0307adbb5cc9897ce04417a16))
-
-## [0.8.0](https://github.com/us/crw/compare/v0.7.1...v0.8.0) (2026-05-14)
-
-
-### Features
-
-* **cli:** add interactive setup wizard ([a5613b9](https://github.com/us/crw/commit/a5613b965d3444ab0ad214b976cbf6e56747e523))
-
-## [0.7.1](https://github.com/us/crw/compare/v0.7.0...v0.7.1) (2026-05-12)
-
-
-### Bug Fixes
-
-* bump stale internal version pins to 0.7.0 ([#48](https://github.com/us/crw/issues/48)) ([0bec22a](https://github.com/us/crw/commit/0bec22a76e03f428e28281b30bb34364bf5e5edd))
-
-## [0.7.0](https://github.com/us/crw/compare/v0.6.4...v0.7.0) (2026-05-12)
-
-
-### Features
-
-* LLM summary and search answer (BYOK) ([#45](https://github.com/us/crw/issues/45)) ([ffcc2a5](https://github.com/us/crw/commit/ffcc2a52cd273dc334dd46b663be24fd45df4711))
-
-## [0.6.4](https://github.com/us/crw/compare/v0.6.3...v0.6.4) (2026-05-12)
-
-
-### Features
-
-* **renderer:** add bounded browser-context pool for Chrome tier ([#43](https://github.com/us/crw/issues/43)) ([69b4861](https://github.com/us/crw/commit/69b48610d269c37fa043bcd58855b3970f554f94))
-
-## [0.6.3](https://github.com/us/crw/compare/v0.6.2...v0.6.3) (2026-05-12)
-
-
-### Features
-
-* **map:** drop action URLs and strip tracking params (closes [#40](https://github.com/us/crw/issues/40)) ([#41](https://github.com/us/crw/issues/41)) ([6d9ed39](https://github.com/us/crw/commit/6d9ed39f67e4d92cc51ca16ccc21e451c4bb0373))
-
-## [0.6.2](https://github.com/us/crw/compare/v0.6.1...v0.6.2) (2026-05-10)
-
-
-### Features
-
-* **search:** add /v1/search endpoint backed by bundled SearXNG sidecar ([f4bd7f4](https://github.com/us/crw/commit/f4bd7f46db9f286e3c49be95a968951802a90710))
-
-
-### Bug Fixes
-
-* **antibot:** drop bare 'captcha'/'access denied' markers — false positives ([fae6c09](https://github.com/us/crw/commit/fae6c09537cf286bfb08cb9ebefab0c723c4160f))
-* **crawl:** drop redundant `.into_iter()` for clippy 1.95 ([#39](https://github.com/us/crw/issues/39)) ([fb4032b](https://github.com/us/crw/commit/fb4032b86a5c0095e7e69b198ac2017aa7003000))
-* **map:** WordPress sitemap-index timeout (closes [#33](https://github.com/us/crw/issues/33)) ([c3dfd6c](https://github.com/us/crw/commit/c3dfd6c66ff6bdbbaf3d2ce1646dbb9d7ac6dd5a))
-* **release:** register crw-search crate in release manifest ([9074761](https://github.com/us/crw/commit/907476163c69c5fd8e421e5063686a750c10ce24))
-* **search:** codex iteration-1 hardening — error mapping, resource bounds, container ([5acba7b](https://github.com/us/crw/commit/5acba7bbf1be2cc147e5c25ad9fca80e9bce757d))
-* **search:** codex iteration-2 — error-body cap, per-source row budget, doc ([a440d6e](https://github.com/us/crw/commit/a440d6e4ae3b6ac0dc8decdead3efe04ad33bc43))
-* **search:** codex iteration-3 — predicate-based well-formed filter ([4b4df3a](https://github.com/us/crw/commit/4b4df3a521cba31cd2a82f2d3595d726cb4b2c16))
-* **search:** use real SearXNG image tag and add fallback secret_key ([be1f403](https://github.com/us/crw/commit/be1f403648d352bc68037b0c5ba208729b96d1fa))
-
-## [0.6.1](https://github.com/us/crw/compare/v0.6.0...v0.6.1) (2026-05-09)
-
-
-### Features
-
-* **metrics:** cdp_pending_requests, cdp_live_connections, ([b5f7bec](https://github.com/us/crw/commit/b5f7bec28308e4f0094b7bbcbbecc5d2f734e385))
-* **renderer:** live-connection registry + 60s telemetry sampler ([b5f7bec](https://github.com/us/crw/commit/b5f7bec28308e4f0094b7bbcbbecc5d2f734e385))
-* **renderer:** target lifecycle metric + leaked detection ([b5f7bec](https://github.com/us/crw/commit/b5f7bec28308e4f0094b7bbcbbecc5d2f734e385))
-* **server:** /ready endpoint with deep status code ([b5f7bec](https://github.com/us/crw/commit/b5f7bec28308e4f0094b7bbcbbecc5d2f734e385))
-
-
-### Bug Fixes
-
-* **release:** bulletproof publish pipeline and drop pdf feature ([8fcf2f6](https://github.com/us/crw/commit/8fcf2f656aabe1a8a05db7d6c21011e06959e184))
-* **renderer:** invalidate cached chrome WS URL on connect failure ([b5f7bec](https://github.com/us/crw/commit/b5f7bec28308e4f0094b7bbcbbecc5d2f734e385))
-
-## [0.6.0](https://github.com/us/crw/compare/v0.5.0...v0.6.0) (2026-05-09)
-
-
-### Features
-
-* **extract:** scale recall to 63.74% on 1000-URL benchmark ([5b85555](https://github.com/us/crw/commit/5b855554c5f7ba16981fbe2060e25cca4ba81686))
-* **renderer:** add browserless/chromium opt-in stealth profile (+2.5pt) ([d2414c9](https://github.com/us/crw/commit/d2414c9cd89dc01447b9e52501aa26180ce7d326))
-* **renderer:** chrome-stealth wiring + CDP discovery improvements ([6b2e77c](https://github.com/us/crw/commit/6b2e77c2a356ef8fc453560870985819ce75483a))
-* **server,core,crawl:** plumb tier timeouts and recall pipeline ([7cbee43](https://github.com/us/crw/commit/7cbee43e5db319f0af39dddea07faccbf0cd25ee))
-
-
-### Miscellaneous
-
-* release 0.6.0 ([bd03a35](https://github.com/us/crw/commit/bd03a352922b293431e49722c052f90c945f1c56))
-
-## [0.5.0](https://github.com/us/crw/compare/v0.4.2...v0.5.0) (2026-05-04)
-
-
-### Features
-
-* **core:** add deadline module and request/renderer config scaffolding ([5a4e69a](https://github.com/us/crw/commit/5a4e69ae605d15c0090f3d866db0f8f4fa23a715))
-* **core:** thread end-to-end Deadline through scrape pipeline ([5991986](https://github.com/us/crw/commit/5991986cdac9756500dab40b8bf05ad454dbd21c))
-* **crawl:** key per-domain rate limiter by eTLD+1 ([39c7954](https://github.com/us/crw/commit/39c7954881cfde47e34dad2eaa4141f1f10b1156))
-* **crawl:** per-host concurrency cap on the eTLD+1 limiter ([274f462](https://github.com/us/crw/commit/274f462b2755a02fc2485bddc7ac8ad3fd11c0e3))
-* **renderer:** add browserless/chromium opt-in stealth profile ([236f626](https://github.com/us/crw/commit/236f62682f29011a959bdef5a9770475a809f0a9))
-* **renderer:** chrome nav-budget cap + truncated/deadline_exceeded flags ([c57cef8](https://github.com/us/crw/commit/c57cef8c6ad2ba2fefce7f4110685bc779359378))
-* **renderer:** chrome request-paused interception pump (T27) ([13fcaa4](https://github.com/us/crw/commit/13fcaa4c5560f254d67682bff96ba24e39cdf13e))
-* **renderer:** leak-through fallback when global breaker open & host clean ([86a9e36](https://github.com/us/crw/commit/86a9e36880f2dddcb3d7b7bd6c993825559cf487))
-* **renderer:** outcome-aware breaker + extraction and stealth fixes ([86dd10f](https://github.com/us/crw/commit/86dd10fd014235cb9bd107e32c7cf6e04cb03367))
-* **renderer:** own per-eTLD+1 host limiter in FallbackRenderer ([0577516](https://github.com/us/crw/commit/0577516bd41dc284f24cbaf3ed95544504ba50be))
-* **renderer:** recover FC-wins URLs to reach 92% bench coverage ([ba12424](https://github.com/us/crw/commit/ba12424e44c34aa44bb8a41bc1f16d1dd87f498a))
-
-
-### Bug Fixes
-
-* **compose:** auto-restart and bound memory for renderer containers ([dd610cc](https://github.com/us/crw/commit/dd610ccae2579138d5438795e1d5ac441a0fafc3))
-* **core:** emit meaningful Timeout value when deadline already expired ([607bb27](https://github.com/us/crw/commit/607bb27692686f3563af52ea721d7dfb800d0405))
-* **crawl:** prioritize anti-bot detection over placeholder warning ([05aa933](https://github.com/us/crw/commit/05aa93358f3fa9826eb97db114bef06d1754dae3))
-* escalate to JS renderer on HTTP failure and empty markdown ([9fc7934](https://github.com/us/crw/commit/9fc79344702e30be0555e63a02aa5377f15cca93))
-* **mcp:** apply per-endpoint timeouts to proxy client ([741f1b2](https://github.com/us/crw/commit/741f1b245e064b267b4fb0dfb5487099bc86e2e4))
-* **renderer:** enforce Deadline in HttpFetcher via tokio::time::timeout ([b1c4058](https://github.com/us/crw/commit/b1c4058f47eed204d413a51c56d8ae43f547ff63))
-* **renderer:** keep larger thin-result HTML when stitching attempts ([8147236](https://github.com/us/crw/commit/8147236cc6b94d3c2db34f1128a687d9e110dc35))
-* **renderer:** rescue 39 bench failures via UA, retry, and thin-content escalation ([ddacb49](https://github.com/us/crw/commit/ddacb49e92688c3a20c7f7fe32da58d83c620f31))
-* **server:** classify anti-bot challenges as anti_bot, not no-markdown ([3ece4dd](https://github.com/us/crw/commit/3ece4dd5b5318f71fe3744fa9d09948afaa738de))
-
-
-### Performance
-
-* **renderer:** drop fixed 2s JS wait, rely on SPA selector poll ([cb043f7](https://github.com/us/crw/commit/cb043f7754f870df67a3a56e41a552ba7f7867f4))
-* **renderer:** tighten tier timeouts and bump LP retry threshold ([3f93d60](https://github.com/us/crw/commit/3f93d6052251eb72abee20ea4992ca3cdfc7ddb4))
-* **renderer:** widen breaker tolerance to 20 failures / 10s cooldown ([6525a84](https://github.com/us/crw/commit/6525a84c18e2c4fafa92cc0d29203310755d3ef1))
-
-
-### Miscellaneous
-
-* release 0.5.0 ([3987de1](https://github.com/us/crw/commit/3987de1b15b5d7605cc26645d14b74020c8eb7a9))
-
-## [0.4.2](https://github.com/us/crw/compare/v0.4.1...v0.4.2) (2026-04-29)
-
-
-### Features
-
-* **core:** add render decision types and prometheus metrics scaffold ([e08682b](https://github.com/us/crw/commit/e08682b761822a7100e0f40cffe4cd4f3dcf2a5c))
-* **renderer:** add per-host renderer preference cache ([21e41d1](https://github.com/us/crw/commit/21e41d1330bed255854824f55c3419a590a86411))
-* **renderer:** track HTTP routing and warn on pinned-renderer failure ([3208d27](https://github.com/us/crw/commit/3208d277aa4c480c1257648dc86a7151dcfb8976))
-* **renderer:** wire host preferences, circuit breakers, and CF detection ([0c53c64](https://github.com/us/crw/commit/0c53c645562c43a4f62aa22f1e7f603c42b3b3f3))
-
-
-### Bug Fixes
-
-* **core,renderer:** surface render metadata and harden host normalization ([ee4130b](https://github.com/us/crw/commit/ee4130b62467defb61c5b85bf267c767b3bd909a))
-* **renderer:** correct failure classification and routing decisions ([4d684bd](https://github.com/us/crw/commit/4d684bdaa0cd1a27f011d73322099258a0f713be))
-* **renderer:** probe lifecycle, RAII guard, breaker counter ([02044f5](https://github.com/us/crw/commit/02044f573cd6274231b3856cd799d7e74d61f9ba))
-
-## [0.4.1](https://github.com/us/crw/compare/v0.4.0...v0.4.1) (2026-04-28)
-
-
-### Features
-
-* add per-request renderer field for scrape and crawl APIs ([#29](https://github.com/us/crw/issues/29)) ([f1e0b63](https://github.com/us/crw/commit/f1e0b63fd28be0ceb38342086a309f92bbbc1e53))
-* **crw-browse:** add interactive browser MCP server with phase-2 tools ([e78879d](https://github.com/us/crw/commit/e78879db18c7c4b3df2a4984349a65b4493b1cda))
-* honor renderer mode and force_js in config (fixes [#28](https://github.com/us/crw/issues/28)) ([b76e473](https://github.com/us/crw/commit/b76e473facbce08a841ef8bd9fdfac97a552a8fd))
-
-
-### Bug Fixes
-
-* detect failed JS renders and fail over to next renderer ([fca8fd5](https://github.com/us/crw/commit/fca8fd5cadb4fa3c96bf5a315f96ab6d1e63989c))
-* **docs:** use absolute logo paths in site.config.js ([c5c9321](https://github.com/us/crw/commit/c5c93215561094a35038ab6af2b21e91c16199f4))
-* **docs:** use absolute paths for logo and favicon assets ([cdb1451](https://github.com/us/crw/commit/cdb14517da6425c105b95749dec35bbc9e977f5e))
-
-## [0.4.0](https://github.com/us/crw/compare/v0.3.6...v0.4.0) (2026-04-22)
-
-
-### Features
-
-* add crw-browse MCP server, SOCKS5 proxy, extract mcp-proto ([9a53753](https://github.com/us/crw/commit/9a53753baf6d87272bd2417fc87102a8ed34d41b))
-
-
-### Miscellaneous
-
-* release 0.4.0 ([e15fc74](https://github.com/us/crw/commit/e15fc74cf0dfc7c02ca7e6b82258aeff57f74f17))
-
-## [0.3.6](https://github.com/us/crw/compare/v0.3.5...v0.3.6) (2026-04-21)
-
-
-### Features
-
-* **ci:** add Google Indexing API notification for docs changes ([3b5a340](https://github.com/us/crw/commit/3b5a3404e91a1d776275ac312ad08cad86339a98))
-* **docs:** generate static HTML pages for SEO indexability ([7b321c0](https://github.com/us/crw/commit/7b321c0a26cea0da32d42e952f6327b468bdb099))
-
-
-### Bug Fixes
-
-* **ci:** trigger release workflow after release-please creates tag ([27f2b67](https://github.com/us/crw/commit/27f2b67d0b9db4f7b1bacc6c901e9c92131a3a95))
-* **mcp:** bump npm optionalDependencies from 0.3.0 to 0.3.5 ([0e363e0](https://github.com/us/crw/commit/0e363e0fc512eb18bcb8284a9723b00f50e2dfd0))
-* **renderer:** detect loading placeholders and poll for content stability ([d3b642b](https://github.com/us/crw/commit/d3b642b2736b4568fa8a3502e521b8bede60317f))
-
-## [0.3.5](https://github.com/us/crw/compare/v0.3.4...v0.3.5) (2026-04-09)
-
-
-### Features
-
-* **mcp:** add crw_search tool for cloud/proxy mode ([7fe4a8e](https://github.com/us/crw/commit/7fe4a8e79aae9dfcd0b400c17f175af583a33eef))
-
-## [0.3.4](https://github.com/us/crw/compare/v0.3.3...v0.3.4) (2026-04-09)
-
-
-### Bug Fixes
-
-* **config:** env var overrides not applied due to missing prefix_separator ([71c7ae5](https://github.com/us/crw/commit/71c7ae544bd74575cf30101190d65708934bcb1f)), closes [#18](https://github.com/us/crw/issues/18)
-
-## [0.3.3](https://github.com/us/crw/compare/v0.3.2...v0.3.3) (2026-04-09)
-
-
-### Features
-
-* add APT/Debian package distribution ([c34b8e9](https://github.com/us/crw/commit/c34b8e93563c0f3f4b3fa1a1e395e6041e97766c))
-* **renderer:** spawn all available browsers for multi-renderer fallback ([f546437](https://github.com/us/crw/commit/f546437568eb833684978793e5b79880f2710016))
-
-## [0.3.2](https://github.com/us/crw/compare/v0.3.1...v0.3.2) (2026-04-08)
-
-
-### Bug Fixes
-
-* **cli:** auto-prepend https:// when no scheme provided ([1050606](https://github.com/us/crw/commit/105060644acb1ef930555869372f5413947ac194))
-
-## [0.3.1](https://github.com/us/crw/compare/v0.3.0...v0.3.1) (2026-04-08)
-
-
-### Features
-
-* add llms.txt, SKILL.md, MCP init command, and docs UI improvements ([1b22d19](https://github.com/us/crw/commit/1b22d194ec9a8b8db8db39a1d44ce38a56716f5d))
-* add one-line install script with auto platform detection ([6354f79](https://github.com/us/crw/commit/6354f7929896bb9a12eeebb9d5bf439731fac874))
-* **docs:** add dark mode logo support and improve docs UI ([047df7b](https://github.com/us/crw/commit/047df7b46485d9cdec76b213db181dc0aa592511))
-* **docs:** align design with SaaS site and update branding ([631d07c](https://github.com/us/crw/commit/631d07c66a34bcc71e8d2494a177182977886a8c))
-* **docs:** unify docs into docs.fastcrw.com with Mintlify-style design ([4994998](https://github.com/us/crw/commit/4994998ae97924100e4415b90a5b78db3b8cf09e))
-* **docs:** update URLs, dark mode, syntax highlighting, and benchmarks ([0678cdf](https://github.com/us/crw/commit/0678cdfde6a9de9b5fa56ec2c6256a63a0342317))
-* release all 3 binaries, CLI auto-browser, README overhaul ([aa2950d](https://github.com/us/crw/commit/aa2950d564cb97f668c0c838713f612bffa33e32))
-* update README banner with new logo ([bcba1ad](https://github.com/us/crw/commit/bcba1ad95e7ac1afd3066827f2327452b60c81f0))
-
-
-### Bug Fixes
-
-* crawl HTTP polling bug + SDK test suite + docs ([#16](https://github.com/us/crw/issues/16)) ([b6d8983](https://github.com/us/crw/commit/b6d898360cb2396683e9e82f778d2ee3b8455625))
-* remove internal implementation detail from roadmap ([a5013f0](https://github.com/us/crw/commit/a5013f07f039615de5c5988e6bbf64629b56aa0e))
-
-## [0.3.0](https://github.com/us/crw/compare/v0.2.2...v0.3.0) (2026-04-02)
-
-
-### Features
-
-* add search() method to Python SDK and docs ([591e3fe](https://github.com/us/crw/commit/591e3fed4bbd14b4470fd2f5cbc24c02f7543dba))
-
-## [0.2.2](https://github.com/us/crw/compare/v0.2.1...v0.2.2) (2026-04-02)
-
-
-### Bug Fixes
-
-* **renderer:** escalate to JS renderer on HTTP 401/403 responses ([f515caa](https://github.com/us/crw/commit/f515caa2e315a06df9274967bdc3fb23dbafcbcf))
-* use GitHub latest release instead of pinned version for binary download ([4afcb1a](https://github.com/us/crw/commit/4afcb1a4c67d4e9b36809ed32ce88b6a9fd4c342))
-
-## [0.2.1](https://github.com/us/crw/compare/v0.2.0...v0.2.1) (2026-03-28)
-
-
-### Bug Fixes
-
-* make crw-mcp npm wrapper executable ([576a9eb](https://github.com/us/crw/commit/576a9eb19ae90bc677344045dd70fb96e8b938da))
-* use latest tag in server.json OCI identifier ([7ec3b82](https://github.com/us/crw/commit/7ec3b82ab78aa2c7ff900d07400f8a2426cb955f))
-
-## [0.2.0](https://github.com/us/crw/compare/v0.1.2...v0.2.0) (2026-03-28)
-
-
-### Features
-
-* add MCP Registry support for official server discovery ([154b9f5](https://github.com/us/crw/commit/154b9f520015260d012ebf899513c3af1f9dfe3d))
-
-## [0.1.2](https://github.com/us/crw/compare/v0.1.1...v0.1.2) (2026-03-27)
-
-
-### Bug Fixes
-
-* vendor pdf-inspector as crw-pdf for crates.io publishability ([3f7681d](https://github.com/us/crw/commit/3f7681dde0b78ff2c0c11d232d21a714edb94d75))
-
-## [0.1.1](https://github.com/us/crw/compare/v0.1.0...v0.1.1) (2026-03-26)
-
-
-### Bug Fixes
-
-* skip already-published crates without masking real errors ([010649c](https://github.com/us/crw/commit/010649c522e4e49edcf51873d4c1065e08d510b1))
-
-## [0.1.0](https://github.com/us/crw/compare/v0.0.14...v0.1.0) (2026-03-26)
-
-
-### Features
-
-* add PDF extraction support via pdf-inspector ([06dd5bf](https://github.com/us/crw/commit/06dd5bf89caf004929f22d41d00f8a297d09b825))
-
-## [0.0.14](https://github.com/us/crw/compare/v0.0.13...v0.0.14) (2026-03-25)
-
-
-### Features
-
-* **mcp:** auto-download LightPanda binary for zero-config JS rendering ([41f443b](https://github.com/us/crw/commit/41f443b885326401b653cfcba0054cb943672ca6))
-* **mcp:** auto-spawn headless Chrome for JS rendering in embedded mode ([9a6b0ae](https://github.com/us/crw/commit/9a6b0ae3f16399f8f9f233109e431f74a882d973))
-
-
-### Bug Fixes
-
-* **ci:** move crw-mcp to Tier 4 in release workflow and add workflow_dispatch ([d7584a8](https://github.com/us/crw/commit/d7584a82c0dd4ac0c6cd8b169b19939d92eb4e95))
-
-## [0.0.13](https://github.com/us/crw/compare/v0.0.12...v0.0.13) (2026-03-24)
-
-
-### Features
-
-* **mcp:** add embedded mode — self-contained MCP server, no crw-server needed ([75e5450](https://github.com/us/crw/commit/75e54504487f24ee30c0272bb83eb9aab807a284))
-
-
-### Bug Fixes
-
-* **ci:** switch release-please to simple type for Rust workspace support ([51cd420](https://github.com/us/crw/commit/51cd420ab77e4bd58bf1a6a7ab0c28287896a0b7))
-
-## v0.0.12
-
-- **Readability drill-down** — when `<main>` or `<article>` wraps >90% of body, the extractor now searches inside for narrower content elements (`.main-page-content`, `.article-content`, `.entry-content`, etc.) instead of discarding. Fixes MDN pages returning 35 chars and StackOverflow returning only the question
-- **Base64 image stripping** — `data:` URI images are removed in both HTML cleaning (lol_html) and markdown post-processing (regex safety net). Eliminates massive base64 blobs from Reddit and similar sites
-- **Select/dropdown removal** — `<select>` elements removed in `onlyMainContent` mode; dropdown/city-selector/location-selector noise patterns added. Fixes Hürriyet city dropdown leaking into content
-- **Extended scored selectors** — added `.main-page-content`, `.js-post-body`, `.s-prose`, `#question`, `.page-content`, `#page-content`, `[role="article"]` for better MDN, StackOverflow, and generic site coverage
-- **Smarter fallback chain** — when primary extraction produces too-short markdown, both fallbacks (cleaned HTML and basic clean) are tried and the longer result is picked, instead of short-circuiting on non-empty but insufficient content
-
-## v0.0.11
-
-- **Stealth anti-bot bypass** — automatic stealth JS injection via `Page.addScriptToEvaluateOnNewDocument` before every CDP navigation. Spoofs `navigator.webdriver`, Chrome runtime object, plugins array, languages, permissions API, iframe `contentWindow`, and `toString()` proxy to bypass Cloudflare, PerimeterX, and other bot detection systems
-- **Cloudflare challenge auto-retry** — detects Cloudflare JS challenge pages ("Just a moment", `cf-browser-verification`, `challenge-platform`) after page load and polls up to 3 times at 3-second intervals for non-interactive challenges to auto-resolve
-- **HTTP → CDP auto-escalation** — `FallbackRenderer::fetch()` in auto mode now checks HTTP responses for anti-bot challenge signatures and automatically escalates to JS rendering when detected, instead of returning the challenge HTML
-- **Chrome failover in Docker** — full automatic failover chain: HTTP → LightPanda → Chrome. Added `chromedp/headless-shell` as a Docker Compose sidecar service with 2GB shared memory. If LightPanda crashes on complex SPAs (React, Angular), Chrome handles the render
-- **Chrome WS URL auto-discovery** — CDP renderer resolves Chrome DevTools WebSocket URL via the `/json/version` HTTP endpoint with `Host: localhost` header (required for chromedp/headless-shell's socat proxy). Uses `OnceCell` for lazy one-time resolution
-- **Proxy configuration docs** — expanded proxy config comments with examples for HTTP, SOCKS5, and residential proxy providers (IPRoyal, Oxylabs, Smartproxy)
-- **Raw string delimiter fix** — fixed `markdown.rs` test that used `r#"..."#` with a string containing `"#`, changed to `r##"..."##`
-
-## v0.0.10 / v0.0.9
-
-- **Crawl cancel endpoint** — `DELETE /v1/crawl/{id}` cancels a running crawl job via `AbortHandle` and returns `{ success: true }`
-- **API rate limiting** — token-bucket rate limiter (configurable `rate_limit_rps`, default 10). Returns 429 with `error_code: "rate_limited"` when exceeded
-- **Machine-readable error codes** — all error responses now include an `error_code` field (e.g. `"invalid_url"`, `"http_error"`, `"rate_limited"`, `"not_found"`)
-- **Map response envelope** — `/v1/map` now returns `{ success, data: { links } }` instead of `{ success, links }` for consistency with other endpoints
-- **Fenced code blocks** — indented code blocks (4-space) are post-processed into fenced (```) blocks for better LLM/RAG compatibility
-- **Sphinx footer cleanup** — `"footer"` added to exact-token noise patterns, catching `<div class="footer">` in Sphinx/documentation sites
-- **`renderedWith: "http"`** — HTTP-only fetches now report `rendered_with: "http"` in metadata instead of `null`
-- **405 JSON responses** — all routes now have `.fallback(method_not_allowed)` returning structured JSON with `error_code: "method_not_allowed"` instead of empty bodies
-- **Anchor link cleanup** — empty anchor links (`[](#id)`, `[¶](#id)`) and pilcrow/section signs stripped from Markdown output
-- **`role="contentinfo"` cleanup** — elements with ARIA roles `contentinfo`, `navigation`, `banner`, `complementary` removed during cleaning
-- **Tiny chunk merging** — topic chunking merges heading-only chunks (<50 chars) with the next chunk to improve RAG embedding quality
-
-## v0.0.8
-
-- **Wikipedia / MediaWiki onlyMainContent fix** — `onlyMainContent: true` now correctly extracts article text from Wikipedia pages (~49% size reduction). Previously the `<html>` element's `class="vector-toc-available"` matched the `"toc"` noise pattern via substring, removing the entire page
-- **3-tier noise pattern matching** — noise class/id matching now uses substring (long patterns), exact-token (short/ambiguous: `toc`, `share`, `social`, `comment`, `related`), and prefix (`ad-`, `ads-`) matching to avoid false positives
-- **Structural element guard** — noise handler never removes `<html>`, `<head>`, `<body>`, or `<main>` elements
-- **Re-clean after readability** — readability output is re-cleaned to strip residual noise (infobox, navbox, catlinks) that survives inside broad containers
-- **Wikipedia-aware readability** — added `.mw-parser-output`, `#mw-content-text`, `#bodyContent` to scored selectors; priority/scored selectors that wrap >90% of body are skipped
-- **BYOK LLM extraction** — per-request `llmApiKey`, `llmProvider`, `llmModel` fields for bring-your-own-key structured extraction without server config
-- **JSON format validation** — `formats: ["json"]` without `jsonSchema` now returns a 400 error instead of a warning
-- **Block detection skip** — pages >50 KB skip interstitial/block detection (no more false "blocked by anti-bot" on Wikipedia)
-- **Null byte URL rejection** — URLs with `%00` or null bytes rejected at validation
-- **Request timeout** — default timeout bumped from 60s to 120s
-- **Dockerfile fix** — corrected `cargo build` flags, added `config.docker.toml`
-
-## v0.0.7
-
-- **`success: false` on 4xx targets** — scraping a 403/404/429 target with minimal body now correctly returns `success: false` with error details, instead of `success: true` with a warning. Targets with real content (custom error pages) still return `success: true` with a warning
-- **JS renderer fallback warning** — when `renderJs: true` is requested but no CDP renderer is available, the response now includes `rendered_with: "http_only_fallback"` and a warning instead of silently falling back
-- **CDP health check** — `is_available()` now runs a real `Browser.getVersion` command instead of just testing the WebSocket connection
-- **Specific error messages** — unknown formats now return descriptive errors (e.g., `"Unknown format 'extract'. Valid formats: ..."`) instead of generic 422
-- **`"extract"` format alias** — `formats: ["extract"]` and `formats: ["llm-extract"]` are now accepted as aliases for `"json"` (Firecrawl compatibility)
-- **Chunk dedup by default** — deduplication is now enabled by default for all chunking strategies; separator-only chunks (`---`, `***`) are filtered out
-- **Chunk relevance scores** — chunks now return `{ content, score, index }` objects instead of plain strings when a query is provided
-- **Map timeout** — `/v1/map` accepts a `timeout` parameter (default 120s, max 300s) to prevent 502s on large sites
-- **Stealth + JS rendering fix** — `stealth: true` with `renderJs: true` no longer bypasses CDP; the shared renderer is used with stealth headers injected
-- **BM25 NaN guard** — prevents `NaN` scores when all chunks are empty
-
-## v0.0.6
-
-- **Crate READMEs on crates.io** — all 7 crates now have detailed README documentation visible on their crates.io pages, with usage examples, API docs, and installation instructions
-
-## v0.0.5
-
-- **`crw-cli` now on crates.io** — install the standalone CLI with `cargo install crw-cli` and scrape URLs without running a server
-- **Parallelized release workflow** — crate publishing uses tiered parallelism, cutting release time by ~2.25 minutes
-- **CLI and MCP install docs** — README now includes `cargo install` instructions for both `crw-cli` and `crw-mcp`
-
-## v0.0.4
-
-- **Hardened rendering and warning semantics** — improved reliability of the rendering pipeline and warning detection logic
-- **XPath output escaping** — XPath extraction results are now properly escaped to prevent injection
-- **Broadened status warnings** — expanded HTTP status code range that triggers warning metadata
-- **Capped interstitial scan** — bounded interstitial page detection to avoid excessive scanning
-- **Clippy cleanup** — simplified status code checks for cleaner, idiomatic Rust
-
-## v0.0.3
-
-- **Warning-aware target handling** — 4xx and anti-bot targets now return `success: true` with `warning` and `metadata.statusCode`
-- **More reliable JS rendering** — CDP navigation now waits for real page lifecycle completion before applying `waitFor`
-- **Stealth decompression fix** — gzip and brotli responses decode cleanly instead of leaking garbled binary payloads
-- **Crawl compatibility** — `limit`, `maxPages`, and `max_pages` now normalize to the same crawl cap
-- **XPath and chunking fixes** — XPath returns all matches, chunk overlap/dedupe is supported, and scorer rank order is preserved
-
-## v0.0.2
-
-- **CSS selector & XPath** — target specific DOM elements before Markdown conversion (`cssSelector`, `xpath`)
-- **Chunking strategies** — split content into topic, sentence, or regex-delimited chunks for RAG pipelines (`chunkStrategy`)
-- **BM25 & cosine filtering** — rank chunks by relevance to a query and return top-K results (`filterMode`, `topK`)
-- **Better Markdown** — switched to `htmd` (Turndown.js port): tables, code block languages, nested lists all render correctly
-- **Stealth mode** — rotate User-Agent from a built-in Chrome/Firefox/Safari pool and inject 12 browser-like headers (`stealth: true`)
-- **Per-request proxy** — override the global proxy on a per-request basis (`proxy: "http://..."`)
-- **Rate limit jitter** — randomized delay between requests to avoid uniform traffic fingerprinting
-- **`crw-server setup`** — one-command JS rendering setup: downloads LightPanda, creates `config.local.toml`
-
-## v0.0.1
-
-- **Firecrawl-compatible REST API** — `/v1/scrape`, `/v1/crawl`, `/v1/map` with identical request/response format
-- **6 output formats** — markdown, HTML, cleaned HTML, raw HTML, plain text, links, structured JSON
-- **LLM structured extraction** — JSON schema in, validated structured data out (Anthropic tool_use + OpenAI function calling)
-- **JS rendering** — auto-detect SPAs via heuristics, render via LightPanda, Playwright, or Chrome (CDP)
-- **BFS crawler** — async crawl with rate limiting, robots.txt, sitemap support, concurrent jobs
-- **MCP server** — built-in stdio + HTTP transport for Claude Code and Claude Desktop
-- **SSRF protection** — private IPs, cloud metadata, IPv6, dangerous URI filtering
-- **Docker ready** — multi-stage build with LightPanda sidecar
+- Research concurrency raised 4→8 with a tighter cache cap.
+
+## [1.0.0] - 2026-06-17
+
+First tagged release of the fork — a camofox-first, anti-detection variant of crw,
+distributed solely as a multi-arch Docker image. This release establishes the
+fork's identity: the camofox (Camoufox / Firefox) browser is the heavy renderer
+and the sole search backend, and the upstream Chrome/Playwright and SearXNG
+machinery is removed.
+
+### Added
+
+- **Camofox renderer tier:** the camofox-browser REST server (Camoufox / Firefox
+  anti-detect browser) is wired in as the heavy/stealth JS tier, taking Chrome's
+  slot in the failover ladder.
+- **Camofox-backed search:** `/v1/search` drives the camofox browser directly —
+  Google via the built-in search macro; Bing, DuckDuckGo, Wikipedia, YouTube,
+  Reddit, and Amazon by navigating their result pages; GitHub via the REST Search
+  API — behind a per-engine extractor registry with a generic fallback.
+- **Multi-engine search:** a `SearchEngine` enum and an `engines` request field
+  fan a query out across up to four engines and merge/dedupe the results, exposed
+  across MCP, OpenAPI, the SDKs, and the CLI (stringified-array args accepted).
+- **crw-browse-camofox:** an MCP server over the camofox REST API for interactive
+  browser control (later switched to the upstream camofox-mcp).
+- A single warm camofox tab is reused across searches to end the context-teardown
+  race that produced empty or 5xx results.
+
+### Changed
+
+- Camofox is the **default heavy renderer** and the **only** `/v1/search` backend.
+- The Docker Compose stack defaults to camofox; distribution is Docker-only
+  (multi-arch image on GHCR).
+
+### Removed
+
+- **BREAKING:** the Chrome and Playwright renderer tiers and `crw-browse` — the
+  ladder is now lightpanda (CDP) plus the camofox / camoufox REST tiers only.
+- **BREAKING:** the SearXNG search backend, replaced entirely by camofox.
+- Upstream's crates.io / npm / PyPI / SDK packaging and install paths.
+
+### Fixed
+
+- Structured-extraction (Anthropic) chat URL no longer doubles `/v1`.
+- Engine cap and camofox-mcp configuration corrected against a live Docker stack.
+
+[1.5.0]: https://github.com/adambenhassen/crw-camofox/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/adambenhassen/crw-camofox/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/adambenhassen/crw-camofox/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/adambenhassen/crw-camofox/compare/v1.1.2...v1.2.0
+[1.1.2]: https://github.com/adambenhassen/crw-camofox/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/adambenhassen/crw-camofox/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/adambenhassen/crw-camofox/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/adambenhassen/crw-camofox/releases/tag/v1.0.0
