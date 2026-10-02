@@ -174,8 +174,8 @@ async fn main() {
     // Browser-using commands route through one consolidated exit
     // (`finish`) so `kill_all_browsers()` runs exactly once on every path.
     // The signal teardown task is installed *before* their `run()` (and
-    // therefore before any browser spawn inside it). Non-browser commands
-    // (search/serve/setup) keep their own lifecycle and own no browser.
+    // therefore before any browser spawn inside it). `search` and `setup` own
+    // no browser and keep their own lifecycle.
     let result: Result<(), CmdError> = match cli.command {
         Some(Commands::Scrape(args)) => {
             install_signal_teardown();
@@ -194,8 +194,14 @@ async fn main() {
             commands::map::run(args).await
         }
         Some(Commands::Serve(args)) => {
-            commands::serve::run(args).await;
-            Ok(())
+            // `serve` owns a browser too once native mode is on (it spawns the
+            // managed LightPanda), so its result routes through `finish` like
+            // the rest — the bind-failure and post-serve paths used to
+            // `process::exit` past the sweep and orphan it. Deliberately NO
+            // signal task here: serve runs its own graceful shutdown, and a
+            // second SIGTERM listener killpg-ing the ladder mid-drain would
+            // trade the orphan leak for a torn shutdown.
+            commands::serve::run(args).await
         }
         Some(Commands::Mcp(args)) => {
             install_signal_teardown();

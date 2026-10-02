@@ -1,11 +1,20 @@
 //! Serve subcommand — start the REST API server.
 //!
 //! Implements the Firecrawl-compatible API at `/v1/*` endpoints.
+//!
+//! Native mode (`[renderer] manage_browsers = true`) makes this command a
+//! browser owner: it spawns the managed LightPanda and holds its guard. So
+//! every failure here returns [`CmdError`] instead of calling
+//! `std::process::exit` — an exit-from-libc skips `Drop`, and the managed
+//! browser's process group would survive us. `teardown::finish` in `main.rs`
+//! is the only place this process dies.
 
 use clap::Args;
 use crw_core::config::AppConfig;
 use crw_server::state::AppState;
 use tracing_subscriber::EnvFilter;
+
+use crate::teardown::CmdError;
 
 #[derive(Args)]
 pub struct ServeArgs {
@@ -22,7 +31,7 @@ pub struct ServeArgs {
     pub config: Option<String>,
 }
 
-pub async fn run(args: ServeArgs) {
+pub async fn run(args: ServeArgs) -> Result<(), CmdError> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -44,7 +53,7 @@ pub async fn run(args: ServeArgs) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to load configuration: {e}");
-            std::process::exit(1);
+            return Err(CmdError::code_only(1));
         }
     };
 
@@ -92,7 +101,7 @@ pub async fn run(args: ServeArgs) {
             "CRW_DISABLE_SERVER_LLM_KEY=1 but [extraction.llm].api_key is also configured. \
              This is forbidden in SaaS-fronted deploys (refusing to boot)."
         );
-        std::process::exit(1);
+        return Err(CmdError::code_only(1));
     }
 
     // Native local mode (see server main.rs / docs/docs/native-macos.md):
@@ -128,8 +137,11 @@ pub async fn run(args: ServeArgs) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("Failed to build application state: {e}");
-            crw_renderer::browser::kill_all_browsers();
-            std::process::exit(1);
+            // A managed LightPanda may already be running: returning lets the
+            // guard drop and `finish`'s single sweep reap it. This site used to
+            // call `kill_all_browsers()` by hand and then `exit(1)`, which the
+            // two paths below never reached.
+            return Err(CmdError::code_only(1));
         }
     };
     tracing::info!(
@@ -172,27 +184,35 @@ pub async fn run(args: ServeArgs) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("Failed to bind to {addr}: {e}");
-            std::process::exit(1);
+            // The common failure (port already taken) lands here *after* the
+            // managed LightPanda is up, so it must return, not exit.
+            return Err(CmdError::code_only(1));
         }
     };
 
     tracing::info!("CRW ready at http://{addr}");
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    let server_result = server.await;
 
-    if let Err(e) = server.await {
-        tracing::error!("Server error: {e}");
-        std::process::exit(1);
-    }
-
-    // HTTP layer is quiesced; now drain the chrome pool
+    // HTTP layer is quiesced; now drain the chrome pool. This runs on the
+    // error path too — `server.await`'s error used to `exit(1)` right past
+    // the drain and the browser sweep below, orphaning the managed browser.
     renderer.shutdown_chrome_pool(pool_drain).await;
 
-    // Managed browser processes (light tier guard + any camofox supervisor
-    // children registered by AppState) — sweep the process-group registry.
-    crw_renderer::browser::kill_all_browsers();
-
-    tracing::info!("Server shut down gracefully");
+    // Managed browser processes (the light-tier guard plus any camofox
+    // supervisor children registered by AppState) are swept exactly once by
+    // `teardown::finish` on the way out, whichever branch we return.
+    match server_result {
+        Ok(()) => {
+            tracing::info!("Server shut down gracefully");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Server error: {e}");
+            Err(CmdError::code_only(1))
+        }
+    }
 }
 
 async fn shutdown_signal() {
