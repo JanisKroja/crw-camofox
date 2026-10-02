@@ -27,8 +27,20 @@
 #      for an internal crate (it must inherit), with one allowlisted exception:
 #      crw-server's self dev-dependency (`path = "."`, no version).
 #
-# Portable: bash + python3 (present on ubuntu-latest and macOS).
+# Portable: bash + python3 with `tomllib`, i.e. Python >= 3.11. ubuntu-latest has
+# it; macOS ships /usr/bin/python3 at 3.9, where the parse below would die on
+# `import tomllib` — and because the guard's verdict IS an exit code, that crash
+# would exit 1 and read as a violation to anything watching return codes (the
+# regression suite's failure-path tests would pass for the wrong reason). Exit 2
+# instead: "could not run", never "found a problem".
 set -euo pipefail
+
+if ! python3 -c 'import tomllib' >/dev/null 2>&1; then
+  echo "error: this guard needs python3 >= 3.11 (tomllib); found $(python3 -V 2>&1)" >&2
+  echo "       locally: brew install python@3.12 (macOS' system python3 is 3.9)." >&2
+  echo "       Exit code 2 means the guard could not run — not that it found a pin out of sync." >&2
+  exit 2
+fi
 
 # Repo root defaults to this script's parent, but tests override it with a
 # fixture dir (scripts/release/test_guards.py) to exercise failure modes.

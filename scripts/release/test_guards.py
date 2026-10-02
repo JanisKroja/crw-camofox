@@ -16,6 +16,13 @@ cwd), so we test what actually ships, not a reimplementation.
 Dependency-free: runs under plain `uv run python scripts/release/test_guards.py`
 (no pytest needed — robust in CI without a network install) and is ALSO
 collectible by pytest if present, since the test_* functions take no fixtures.
+
+One dependency lives in the guard rather than here: it parses TOML with
+`tomllib`, so it needs python3 >= 3.11 and exits 2 ("could not run") without it
+— macOS ships a 3.9 system python3. Exit 2 is deliberately distinct from the 1
+these failure-path tests assert, and `_assert_verdict` names it, so a starved
+interpreter goes red with that message instead of the failure paths passing
+vacuously on a traceback.
 """
 from __future__ import annotations
 
@@ -120,6 +127,25 @@ def run_audit(fixture: Path) -> subprocess.CompletedProcess:
     )
 
 
+def assert_verdict(proc: subprocess.CompletedProcess, expected: int) -> None:
+    """Assert the guard's exit code, quoting its verdict on failure.
+
+    The three codes mean different things and must not be conflated: 0 = green,
+    1 = a real version violation, 2 = the guard could not run (it wants a
+    python3 with `tomllib`). On the older system python3 a bare traceback also
+    used to surface as 1 here, so the failure-path tests below would pass for
+    the wrong reason and the happy path would fail as a mystery.
+    """
+    verdict = {0: "green", 1: "violation", 2: "could not run"}.get(
+        proc.returncode, "unexpected"
+    )
+    expected_verdict = {0: "green", 1: "violation", 2: "could not run"}.get(expected, "?")
+    assert proc.returncode == expected, (
+        f"guard exited {proc.returncode} ({verdict}), expected {expected} "
+        f"({expected_verdict})\n--- stdout ---\n{proc.stdout}--- stderr ---\n{proc.stderr}"
+    )
+
+
 def patch_toml(fixture: Path, old: str, new: str) -> None:
     p = fixture / "Cargo.toml"
     text = p.read_text()
@@ -141,7 +167,7 @@ def test_green_baseline(tmp_path):
     make_fixture(tmp_path)
     g = run_guard(tmp_path)
     a = run_audit(tmp_path)
-    assert g.returncode == 0, g.stdout + g.stderr
+    assert_verdict(g, 0)
     assert a.returncode == 0, a.stdout + a.stderr
 
 
@@ -156,7 +182,7 @@ def test_drift_pin_off_workspace_version(tmp_path):
         'crw-core = { path = "crates/crw-core", version = "1.0.0" }',
         'crw-core = { path = "crates/crw-core", version = "0.9.0" }',
     )
-    assert run_guard(tmp_path).returncode == 1
+    assert_verdict(run_guard(tmp_path), 1)
 
 
 def test_anti_vacuity_no_centralized_pins(tmp_path):
@@ -167,7 +193,7 @@ def test_anti_vacuity_no_centralized_pins(tmp_path):
         '\ncrw-core = { path = "crates/crw-core", version = "1.0.0" }\n',
         "\n",
     )
-    assert run_guard(tmp_path).returncode == 1
+    assert_verdict(run_guard(tmp_path), 1)
 
 
 def test_residual_inline_pin_rejected(tmp_path):
@@ -180,14 +206,14 @@ def test_residual_inline_pin_rejected(tmp_path):
             'crw-core = { path = "../crw-core", version = "1.0.0" }',
         )
     )
-    assert run_guard(tmp_path).returncode == 1
+    assert_verdict(run_guard(tmp_path), 1)
 
 
 def test_self_dev_dep_allowlisted(tmp_path):
     """The crw-server self dev-dep (path = '.', no version) must stay allowed."""
     make_fixture(tmp_path)
     # Baseline already contains the self dev-dep; guard must be green.
-    assert run_guard(tmp_path).returncode == 0
+    assert_verdict(run_guard(tmp_path), 0)
 
 
 # --- audit failure modes --------------------------------------------------
