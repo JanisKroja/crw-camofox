@@ -59,6 +59,28 @@ and the project uses [Semantic Versioning](https://semver.org/).
 - The tab-close budget no longer produces a leak signal when only the *client*
   gave up: camofox allows its own `safePageClose` 5 s against our shorter
   timeout, so that close usually lands anyway.
+- **lightpanda (native mode): Intel Macs and ARM Linux no longer fall out of the
+  light tier.** The nightly-asset table was written out three times —
+  `crw-renderer`'s auto-download, `crw-server setup`, `crw-cli setup` — and each
+  copy had drifted into its own idea of the matrix: `macOS x86_64` was in none of
+  them, `Linux aarch64` only in the renderer. On an Intel Mac `setup --camofox`
+  therefore refused to run at all ("LightPanda provides binaries for Linux
+  x86_64 and macOS aarch64") while the render ladder quietly lost its light tier
+  behind a single `debug!`. All four upstream nightlies (`x86_64`/`aarch64` ×
+  `linux`/`macos`) are now in all three sites, the refusal text states what
+  upstream actually ships, and a `crw-renderer` test pins the table plus checks
+  that both `setup` copies still name every asset.
+- **cli serve: a failed boot no longer orphans the managed browser.** Native mode
+  made `crw serve` a browser owner — it spawns the managed LightPanda before the
+  listener is bound — but the command still died through five `std::process::exit`
+  calls written back when it owned nothing, and an exit from libc skips `Drop`, so
+  the LightPanda process group outlived it. A taken port (the common case) leaked
+  it outright; a server error leaked it *and* skipped the chrome-pool drain.
+  `serve::run` now returns `CmdError` like every other browser-using command, so
+  `teardown::finish` reaps exactly once on every path. Those same five exits are
+  also what holds the repo's own unguarded-exit guard red at trunk: the managed
+  spawn is what pulled `serve.rs` into its scan set, and CI has not run on the
+  branch since that merge.
 
 ### Added
 
